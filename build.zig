@@ -614,13 +614,15 @@ pub fn build(b: *std.Build) void {
     }
 
     // ---------- tests ----------
+    const test_filter = b.option([]const u8, "test-filter", "Run tests containing this text");
+    const test_filters: []const []const u8 = if (test_filter) |filter| &.{filter} else &.{};
     const test_step = b.step("test", "Run all tests");
     if (!is_wasi) {
-        const compat_tests = b.addTest(.{ .root_module = compat_module });
+        const compat_tests = b.addTest(.{ .root_module = compat_module, .filters = test_filters });
         compat_tests.root_module.link_libc = true;
         test_step.dependOn(&b.addRunArtifact(compat_tests).step);
 
-        const lib_tests = b.addTest(.{ .root_module = lib_mod.? });
+        const lib_tests = b.addTest(.{ .root_module = lib_mod.?, .filters = test_filters });
         if (sqlite3) |lib| {
             lib_tests.root_module.linkLibrary(lib);
         }
@@ -628,7 +630,7 @@ pub fn build(b: *std.Build) void {
             lib_tests.root_module.linkSystemLibrary("pq", .{});
         }
 
-        const exe_tests = b.addTest(.{ .root_module = exe.root_module });
+        const exe_tests = b.addTest(.{ .root_module = exe.root_module, .filters = test_filters });
         test_step.dependOn(&b.addRunArtifact(lib_tests).step);
         test_step.dependOn(&b.addRunArtifact(exe_tests).step);
     }

@@ -692,7 +692,13 @@ fn curlRequestWithProxy(
     max_time: ?[]const u8,
     resolve_entry: ?[]const u8,
 ) ![]u8 {
-    if (credentialedCurlUsesHttpFallback(url, headers, resolve_entry)) {
+    // Preserve deadlines with private header files. URLs with inline credentials
+    // or parameters retain the native path so they do not enter process argv.
+    const bounded_header_auth = if (max_time != null) blk: {
+        const uri = std.Uri.parse(url) catch break :blk false;
+        break :blk uri.user == null and uri.password == null and uri.query == null and uri.fragment == null;
+    } else false;
+    if (credentialedCurlUsesHttpFallback(url, headers, resolve_entry) and !bounded_header_auth) {
         const method_enum = std.meta.stringToEnum(std.http.Method, method) orelse return error.UnsupportedHttpMethod;
         const content_type = contentTypeHeaderValue(content_type_header) orelse return error.InvalidHeader;
         const resp = try httpRequestWithStatus(allocator, method_enum, url, body, headers, content_type, proxy);
@@ -1677,6 +1683,58 @@ test "credentialed curl args route to std http fallback" {
     try std.testing.expect(hasCredentialedCurlArgs("https://example.com/v1", &.{"Authorization: Bearer test-token"}));
     try std.testing.expect(hasCredentialedCurlArgs("https://example.com/v1?access_token=test-token", &.{}));
     try std.testing.expect(!hasCredentialedCurlArgs("https://example.com/v1", &.{"User-Agent: nullclaw-test"}));
+}
+
+test "credentialed POST deadline returns before a stalled server" {
+    if (comptime @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+    const ServerCtx = struct {
+        server: *std_compat.net.Server,
+        release: AtomicBool = AtomicBool.init(false),
+        saw_authorization: AtomicBool = AtomicBool.init(false),
+
+        fn serve(ctx: *@This()) void {
+            var conn = ctx.server.accept() catch return;
+            defer conn.stream.close();
+            var buffer: [2048]u8 = undefined;
+            var filled: usize = 0;
+            while (filled < buffer.len) {
+                const n = conn.stream.read(buffer[filled..]) catch return;
+                if (n == 0) return;
+                filled += n;
+                if (std.mem.indexOf(u8, buffer[0..filled], "\r\n\r\n") != null) break;
+            }
+            ctx.saw_authorization.store(std.mem.indexOf(u8, buffer[0..filled], "Authorization: Bot fake-test-token") != null, .release);
+            for (0..150) |_| {
+                if (ctx.release.load(.acquire)) return;
+                std_compat.thread.sleep(20 * std.time.ns_per_ms);
+            }
+            conn.stream.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}") catch {};
+        }
+    };
+    const allocator = std.testing.allocator;
+    const address = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try address.listen(.{});
+    defer server.deinit();
+    var context = ServerCtx{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, ServerCtx.serve, .{&context});
+    defer {
+        context.release.store(true, .release);
+        if (!context.saw_authorization.load(.acquire)) unblockCredentialedCurlFallbackServer(&server);
+        thread.join();
+    }
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/typing", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+    const started = std_compat.time.milliTimestamp();
+    const result = curlPostWithProxy(allocator, url, "{}", &.{"Authorization: Bot fake-test-token"}, null, "1");
+    const elapsed = std_compat.time.milliTimestamp() - started;
+    if (result) |body| {
+        allocator.free(body);
+        return error.ExpectedTimeout;
+    } else |err| {
+        try std.testing.expectEqual(error.CurlTimeout, err);
+    }
+    try std.testing.expect(context.saw_authorization.load(.acquire));
+    try std.testing.expect(elapsed < 2500);
 }
 
 const LegacyCredentialedCurlHelper = enum {

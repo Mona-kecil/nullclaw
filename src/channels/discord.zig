@@ -358,7 +358,8 @@ pub const DiscordChannel = struct {
         auth_writer.print("Authorization: Bot {s}", .{self.token}) catch return;
         const auth_header = auth_writer.buffered();
 
-        const resp = root.http_util.httpPostJsonWithProxy(self.allocator, url, "{}", &.{auth_header}, null) catch return;
+        // stopTyping joins this thread; optional network I/O must have a deadline.
+        const resp = root.http_util.curlPostWithProxy(self.allocator, url, "{}", &.{auth_header}, null, "3") catch return;
         self.allocator.free(resp);
     }
 
