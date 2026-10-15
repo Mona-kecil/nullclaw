@@ -173,7 +173,7 @@ pub const OpenAiCodexProvider = struct {
     }
 
     fn supportsVisionImpl(_: *anyopaque) bool {
-        return false;
+        return true;
     }
 
     fn supportsStreamingImpl(_: *anyopaque) bool {
@@ -276,7 +276,34 @@ fn buildCodexBody(
 
         if (msg.role == .user) {
             try buf.appendSlice(allocator, "{\"type\":\"message\",\"role\":\"user\",\"content\":");
-            try root.appendJsonString(&buf, allocator, msg.content);
+            if (msg.content_parts) |parts| {
+                try buf.append(allocator, '[');
+                for (parts, 0..) |part, i| {
+                    if (i > 0) try buf.append(allocator, ',');
+                    switch (part) {
+                        .text => |text| {
+                            try buf.appendSlice(allocator, "{\"type\":\"input_text\",\"text\":");
+                            try root.appendJsonString(&buf, allocator, text);
+                        },
+                        .image_url => |image| {
+                            try buf.appendSlice(allocator, "{\"type\":\"input_image\",\"image_url\":");
+                            try root.appendJsonString(&buf, allocator, image.url);
+                            try buf.appendSlice(allocator, ",\"detail\":");
+                            try root.appendJsonString(&buf, allocator, image.detail.toSlice());
+                        },
+                        .image_base64 => |image| {
+                            const data_url = try std.fmt.allocPrint(allocator, "data:{s};base64,{s}", .{ image.media_type, image.data });
+                            defer allocator.free(data_url);
+                            try buf.appendSlice(allocator, "{\"type\":\"input_image\",\"image_url\":");
+                            try root.appendJsonString(&buf, allocator, data_url);
+                        },
+                    }
+                    try buf.append(allocator, '}');
+                }
+                try buf.append(allocator, ']');
+            } else {
+                try root.appendJsonString(&buf, allocator, msg.content);
+            }
             try buf.append(allocator, '}');
         } else if (msg.role == .assistant) {
             try buf.appendSlice(allocator, "{\"type\":\"message\",\"role\":\"assistant\",\"content\":");
@@ -1060,6 +1087,62 @@ pub fn tryLoadCodexCliToken(allocator: std.mem.Allocator) ?auth.OAuthToken {
 // ════════════════════════════════════════════════════════════════════════════
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
+
+test "Codex vision capability enables image preprocessing" {
+    var provider = OpenAiCodexProvider{
+        .allocator = std.testing.allocator,
+        .access_token = null,
+        .refresh_token = null,
+        .account_id = null,
+        .expires_at = 0,
+    };
+    try std.testing.expect(provider.provider().supportsVisionForModel("gpt-6.1-sol"));
+}
+
+test "buildCodexBody serializes mixed image content instead of marker text" {
+    const parts = [_]root.ContentPart{
+        .{ .text = "Read \"this\"\nplease" },
+        .{ .image_url = .{ .url = "https://example.com/photo.png?a=\"b\"", .detail = .high } },
+        .{ .image_base64 = .{ .data = "aGVsbG8=", .media_type = "image/png" } },
+    };
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "[IMAGE:/tmp/photo.png]", .content_parts = &parts },
+        .{ .role = .assistant, .content = "A photo" },
+        .{ .role = .user, .content = "Thanks" },
+    };
+    const body = try buildCodexBody(std.testing.allocator, null, &messages, "gpt-6.1-sol", "high");
+    defer std.testing.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const input = parsed.value.object.get("input").?.array.items;
+    const content = input[0].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), content.len);
+    try std.testing.expectEqualStrings("input_text", content[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings(parts[0].text, content[0].object.get("text").?.string);
+    try std.testing.expectEqualStrings("input_image", content[1].object.get("type").?.string);
+    try std.testing.expectEqualStrings(parts[1].image_url.url, content[1].object.get("image_url").?.string);
+    try std.testing.expectEqualStrings("high", content[1].object.get("detail").?.string);
+    try std.testing.expectEqualStrings("input_image", content[2].object.get("type").?.string);
+    try std.testing.expectEqualStrings("data:image/png;base64,aGVsbG8=", content[2].object.get("image_url").?.string);
+    try std.testing.expectEqualStrings("A photo", input[1].object.get("content").?.string);
+    try std.testing.expectEqualStrings("Thanks", input[2].object.get("content").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, body, "[IMAGE:") == null);
+}
+
+test "buildCodexBody accepts an image marker without a caption" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var messages = [_]ChatMessage{
+        .{ .role = .user, .content = "[IMAGE:data:image/png;base64,iVBORw0KGgo=]" },
+    };
+    const prepared = try @import("../multimodal.zig").prepareMessagesForProvider(arena.allocator(), &messages, .{});
+    const body = try buildCodexBody(arena.allocator(), null, prepared, "gpt-6.1-sol", null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), body, .{});
+    const content = parsed.value.object.get("input").?.array.items[0].object.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), content.len);
+    try std.testing.expectEqualStrings("input_image", content[0].object.get("type").?.string);
+    try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgo=", content[0].object.get("image_url").?.string);
+}
 
 test "buildCodexBody with system and user messages" {
     const messages = [_]ChatMessage{
