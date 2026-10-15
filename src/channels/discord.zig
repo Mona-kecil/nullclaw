@@ -1412,13 +1412,245 @@ pub const DiscordChannel = struct {
         }
     }
 
+    const NativeOptionSpec = struct {
+        type: u8,
+        name: []const u8,
+        description: []const u8,
+        required: bool = false,
+        max_length: usize,
+    };
+    const NativeCommandSpec = struct {
+        type: u8,
+        name: []const u8,
+        description: []const u8,
+        default_member_permissions: ?[]const u8,
+        nsfw: bool,
+        options: []const NativeOptionSpec = &.{},
+    };
+    const NativeCallback = struct {
+        ctx: *anyopaque,
+        send: *const fn (*anyopaque, []const u8, []const u8, []const u8) anyerror!void,
+    };
+
+    fn loadCommandCatalog(allocator: std.mem.Allocator) !std.json.Parsed([]NativeCommandSpec) {
+        const parsed = try std.json.parseFromSlice([]NativeCommandSpec, allocator, @embedFile("discord_commands.json"), .{});
+        errdefer parsed.deinit();
+        for (parsed.value, 0..) |command, i| {
+            if (command.type != 1 or command.name.len == 0 or command.description.len == 0 or command.default_member_permissions != null or command.nsfw or command.options.len > 1) return error.InvalidCatalog;
+            for (parsed.value[0..i]) |other| {
+                if (std.mem.eql(u8, command.name, other.name)) return error.InvalidCatalog;
+            }
+            for (command.options) |option| {
+                if (option.type != 3 or !std.mem.eql(u8, option.name, "args") or option.required or option.max_length != MAX_MESSAGE_LEN or option.description.len == 0) return error.InvalidCatalog;
+            }
+        }
+        return parsed;
+    }
+
+    fn nativeString(object: std.json.ObjectMap, key: []const u8) ![]const u8 {
+        const value = object.get(key) orelse return error.InvalidInteraction;
+        if (value != .string or value.string.len == 0) return error.InvalidInteraction;
+        return value.string;
+    }
+
+    fn nativeUrlPart(value: []const u8) bool {
+        return value.len > 0 and value.len <= 512;
+    }
+
+    fn encodeNativeSegment(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+        if (!nativeUrlPart(value)) return error.InvalidInteraction;
+        var encoded: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer encoded.deinit(allocator);
+        const hex = "0123456789ABCDEF";
+        for (value) |c| {
+            if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') {
+                try encoded.append(allocator, c);
+            } else {
+                try encoded.appendSlice(allocator, &.{ '%', hex[c >> 4], hex[c & 15] });
+            }
+        }
+        return encoded.toOwnedSlice(allocator);
+    }
+
+    fn prepareApplicationCommand(self: *DiscordChannel, d: std.json.ObjectMap) !bus_mod.InboundMessage {
+        const channel_id = try nativeString(d, "channel_id");
+        const guild_id: ?[]const u8 = if (d.contains("guild_id")) try nativeString(d, "guild_id") else null;
+        if (self.guild_id) |configured| {
+            if (guild_id == null or !std.mem.eql(u8, configured, guild_id.?)) return error.Unauthorized;
+        }
+        const user = if (guild_id != null) blk: {
+            const member = d.get("member") orelse return error.InvalidInteraction;
+            if (member != .object) return error.InvalidInteraction;
+            break :blk member.object.get("user") orelse return error.InvalidInteraction;
+        } else blk: {
+            if (d.contains("member")) return error.InvalidInteraction;
+            break :blk d.get("user") orelse return error.InvalidInteraction;
+        };
+        if (user != .object) return error.InvalidInteraction;
+        const user_id = try nativeString(user.object, "id");
+        if (user.object.get("bot")) |bot| {
+            if (bot != .bool) return error.InvalidInteraction;
+            if (bot.bool) return error.Unauthorized;
+        }
+        if (!root.isAllowedScoped("discord channel", self.allow_from, user_id)) return error.Unauthorized;
+        const username: ?[]const u8 = if (user.object.get("username")) |v| switch (v) {
+            .string => v.string,
+            .null => null,
+            else => return error.InvalidInteraction,
+        } else null;
+        const display_name: ?[]const u8 = if (user.object.get("global_name")) |v| switch (v) {
+            .string => v.string,
+            .null => null,
+            else => return error.InvalidInteraction,
+        } else null;
+        const data = d.get("data") orelse return error.InvalidInteraction;
+        if (data != .object) return error.InvalidInteraction;
+        if (data.object.get("type")) |kind| {
+            if (kind != .integer or kind.integer != 1) return error.InvalidInteraction;
+        }
+        const name = try nativeString(data.object, "name");
+        const catalog = try loadCommandCatalog(self.allocator);
+        defer catalog.deinit();
+        const spec = for (catalog.value) |command| {
+            if (std.mem.eql(u8, command.name, name)) break command;
+        } else return error.InvalidInteraction;
+        var args: []const u8 = "";
+        if (data.object.get("options")) |options| {
+            if (options != .array or options.array.items.len > 1) return error.InvalidInteraction;
+            if (options.array.items.len == 1) {
+                if (spec.options.len != 1) return error.InvalidInteraction;
+                const option = options.array.items[0];
+                if (option != .object or option.object.count() != 3) return error.InvalidInteraction;
+                const option_type = option.object.get("type") orelse return error.InvalidInteraction;
+                if (option_type != .integer or option_type.integer != 3) return error.InvalidInteraction;
+                if (!std.mem.eql(u8, try nativeString(option.object, "name"), "args")) return error.InvalidInteraction;
+                const value = option.object.get("value") orelse return error.InvalidInteraction;
+                if (value != .string or value.string.len > MAX_MESSAGE_LEN or std.mem.indexOfScalar(u8, value.string, 0) != null) return error.InvalidInteraction;
+                args = std.mem.trim(u8, value.string, " \t\r\n");
+            }
+        }
+        const text = if (args.len == 0)
+            try std.fmt.allocPrint(self.allocator, "/{s}", .{name})
+        else
+            try std.fmt.allocPrint(self.allocator, "/{s} {s}", .{ name, args });
+        defer self.allocator.free(text);
+        const session_key = if (guild_id == null)
+            try std.fmt.allocPrint(self.allocator, "discord:{s}:direct:{s}", .{ self.account_id, user_id })
+        else
+            try std.fmt.allocPrint(self.allocator, "discord:{s}:channel:{s}", .{ self.account_id, channel_id });
+        defer self.allocator.free(session_key);
+        const metadata = try std.json.Stringify.valueAlloc(self.allocator, .{
+            .is_dm = guild_id == null,
+            .account_id = self.account_id,
+            .interaction = "application_command",
+            .guild_id = guild_id,
+            .sender_username = username,
+            .sender_display_name = display_name,
+        }, .{ .emit_null_optional_fields = false });
+        defer self.allocator.free(metadata);
+        return bus_mod.makeInboundFull(self.allocator, "discord", user_id, channel_id, text, session_key, &.{}, metadata);
+    }
+
+    fn nativeReceipt(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+        return std.fmt.allocPrint(allocator, "{{\"type\":4,\"data\":{{\"content\":{f},\"flags\":64}}}}", .{std.json.fmt(text, .{})});
+    }
+
+    fn handleApplicationCommand(self: *DiscordChannel, data: std.json.Value, callback: NativeCallback) !void {
+        const d = data.object;
+        const id = try nativeString(d, "id");
+        const token = try nativeString(d, "token");
+        if (!nativeUrlPart(id) or !nativeUrlPart(token)) return error.InvalidInteraction;
+        const b = self.bus orelse return error.NoBus;
+        b.inbound.mutex.lock();
+        const closed = b.inbound.closed;
+        b.inbound.mutex.unlock();
+        if (closed) return error.Closed;
+        const msg = self.prepareApplicationCommand(d) catch |err| switch (err) {
+            error.InvalidInteraction, error.Unauthorized => {
+                const rejected = try nativeReceipt(self.allocator, "This command is unavailable.");
+                defer self.allocator.free(rejected);
+                try callback.send(callback.ctx, id, token, rejected);
+                return;
+            },
+            else => return err,
+        };
+        errdefer msg.deinit(self.allocator);
+        const name = d.get("data").?.object.get("name").?.string;
+        const receipt_text = try std.fmt.allocPrint(self.allocator, "Received /{s}. Command output appears in this channel.", .{name});
+        defer self.allocator.free(receipt_text);
+        const receipt = try nativeReceipt(self.allocator, receipt_text);
+        defer self.allocator.free(receipt);
+        try callback.send(callback.ctx, id, token, receipt);
+        try b.publishInboundTimeout(msg, 0);
+    }
+
+    fn nativeCallbackConfig(allocator: std.mem.Allocator, id: []const u8, token: []const u8, body: []const u8) ![]u8 {
+        if (!nativeUrlPart(id) or !nativeUrlPart(token) or body.len > 1024) return error.InvalidInteraction;
+        const encoded_id = try encodeNativeSegment(allocator, id);
+        defer allocator.free(encoded_id);
+        const encoded_token = try encodeNativeSegment(allocator, token);
+        defer allocator.free(encoded_token);
+        return std.fmt.allocPrint(allocator, "url = \"https://discord.com/api/v10/interactions/{s}/{s}/callback\"\nrequest = \"POST\"\nheader = \"Content-Type: application/json\"\ndata-binary = {f}\nmax-time = 2\nconnect-timeout = 2\nsilent\noutput = \"{s}\"\nwrite-out = \"%{{http_code}}\"\n", .{ encoded_id, encoded_token, std.json.fmt(body, .{}), if (builtin.os.tag == .windows) "NUL" else "/dev/null" });
+    }
+
+    fn sendNativeCallback(ctx: *anyopaque, id: []const u8, token: []const u8, body: []const u8) !void {
+        // Tests must inject a callback, including failures, instead of touching the network.
+        if (builtin.is_test) return error.TestNetworkDisabled;
+        const self: *DiscordChannel = @ptrCast(@alignCast(ctx));
+        const config = try nativeCallbackConfig(self.allocator, id, token, body);
+        defer self.allocator.free(config);
+        // -q suppresses user curl config. Credentials travel only through stdin.
+        var child = std_compat.process.Child.init(&.{ "curl", "-q", "--config", "-" }, self.allocator);
+        child.stdin_behavior = .Pipe;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Ignore;
+        try child.spawn();
+        var child_running = true;
+        errdefer if (child_running) {
+            if (child.stdin) |file| {
+                file.close();
+                child.stdin = null;
+            }
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+        };
+        try child.stdin.?.writeAll(config);
+        child.stdin.?.close();
+        child.stdin = null;
+        const status = try child.stdout.?.readToEndAlloc(self.allocator, 16);
+        defer self.allocator.free(status);
+        const term = try child.wait();
+        child_running = false;
+        switch (term) {
+            .exited => |code| if (code != 0) return error.InteractionCallbackFailed,
+            else => return error.InteractionCallbackFailed,
+        }
+        try checkNativeCallbackStatus(status);
+    }
+
+    fn checkNativeCallbackStatus(status: []const u8) !void {
+        if (status.len != 3 or status[0] != '2' or !std.ascii.isDigit(status[1]) or !std.ascii.isDigit(status[2])) return error.InteractionCallbackFailed;
+    }
+
     fn handleInteractionCreate(self: *DiscordChannel, root_val: std.json.Value) !void {
+        return self.handleInteractionCreateWithCallback(root_val, .{ .ctx = self, .send = sendNativeCallback });
+    }
+
+    fn handleInteractionCreateWithCallback(self: *DiscordChannel, root_val: std.json.Value, callback: NativeCallback) !void {
         if (root_val != .object) return;
         const d_val = root_val.object.get("d") orelse return;
         const d_obj = switch (d_val) {
             .object => |o| o,
             else => return,
         };
+
+        const interaction_type = d_obj.get("type") orelse return;
+        if (interaction_type != .integer) return;
+        switch (interaction_type.integer) {
+            2 => return self.handleApplicationCommand(d_val, callback),
+            3 => {},
+            else => return,
+        }
 
         const interaction_id = if (d_obj.get("id")) |v| switch (v) {
             .string => |s| s,
@@ -1914,7 +2146,7 @@ test "discord handleInteractionCreate publishes synthetic inbound command" {
     try ch.registerPendingInteraction("tok1", "c-9", directive);
 
     const interaction_json =
-        \\{"d":{"id":"i-1","token":"itok","channel_id":"c-9","guild_id":"g-9","member":{"user":{"id":"u-9","username":"discord-user","global_name":"Discord User"}},"data":{"custom_id":"nc1:tok1:m1"}}}
+        \\{"d":{"type":3,"id":"i-1","token":"itok","message":{"id":"message-1"},"channel_id":"c-9","guild_id":"g-9","member":{"user":{"id":"u-9","username":"discord-user","global_name":"Discord User"}},"data":{"custom_id":"nc1:tok1:m1"}}}
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, interaction_json, .{});
     defer parsed.deinit();
@@ -1930,6 +2162,10 @@ test "discord handleInteractionCreate publishes synthetic inbound command" {
     try std.testing.expectEqualStrings("discord:dc-main:channel:c-9", msg.session_key);
     try std.testing.expect(msg.metadata_json != null);
     try std.testing.expect(std.mem.indexOf(u8, msg.metadata_json.?, "\"interaction\":\"button\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg.metadata_json.?, "\"replace_message\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg.metadata_json.?, "\"message_id\":\"message-1\"") != null);
+    try ch.handleInteractionCreate(parsed.value);
+    try std.testing.expectEqual(@as(usize, 0), event_bus.inboundDepth());
 }
 
 test "discord handleMessageCreate sets is_dm metadata for direct messages" {
@@ -2228,4 +2464,341 @@ test "discord reconnect backoff clears session on exhaustion" {
     try std.testing.expect(ch.resume_gateway_url == null);
     try std.testing.expectEqual(@as(i64, 0), ch.sequence.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), ch.consecutive_reconnects);
+}
+
+const NativeCallbackCapture = struct {
+    allocator: std.mem.Allocator,
+    body: ?[]u8 = null,
+    calls: usize = 0,
+    fail: bool = false,
+    status: []const u8 = "204",
+    close_bus: ?*bus_mod.Bus = null,
+    observe_bus: ?*bus_mod.Bus = null,
+
+    fn callback(self: *NativeCallbackCapture) DiscordChannel.NativeCallback {
+        return .{ .ctx = self, .send = send };
+    }
+
+    fn send(ctx: *anyopaque, _: []const u8, _: []const u8, body: []const u8) !void {
+        const self: *NativeCallbackCapture = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        if (self.observe_bus) |b| try std.testing.expectEqual(@as(usize, 0), b.inboundDepth());
+        if (self.body) |old| self.allocator.free(old);
+        self.body = try self.allocator.dupe(u8, body);
+        if (self.close_bus) |b| b.close();
+        if (self.fail) return error.CallbackFailed;
+        try DiscordChannel.checkNativeCallbackStatus(self.status);
+    }
+
+    fn deinit(self: *NativeCallbackCapture) void {
+        if (self.body) |body| self.allocator.free(body);
+    }
+};
+
+fn nativeTestEvent(allocator: std.mem.Allocator, name: []const u8, options: []const u8, context: []const u8) !std.json.Parsed(std.json.Value) {
+    const json = try std.fmt.allocPrint(allocator, "{{\"d\":{{\"type\":2,\"id\":\"123\",\"token\":\"test-interaction-token\",\"channel_id\":\"thread-9\",{s},\"data\":{{\"type\":1,\"name\":{f}{s}}}}}}}", .{ context, std.json.fmt(name, .{}), options });
+    defer allocator.free(json);
+    return std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+}
+
+const native_guild_context = "\"guild_id\":\"guild-9\",\"member\":{\"user\":{\"id\":\"user-9\",\"username\":\"neutral-user\",\"global_name\":\"Neutral User\"}}";
+const native_dm_context = "\"user\":{\"id\":\"user-9\",\"username\":\"neutral-user\",\"global_name\":\"Neutral User\"}";
+
+test "discord native catalog commands reach existing handlers with completed receipts" {
+    // Regression: type 2 interactions must reach command dispatch rather than the button custom_id parser.
+    const alloc = std.testing.allocator;
+    var b = bus_mod.Bus.init();
+    defer b.close();
+    var ch = DiscordChannel.initFromConfig(alloc, .{ .token = "test-bot-token", .account_id = "secondary", .guild_id = "guild-9", .allow_from = &.{"user-9"}, .require_mention = true });
+    ch.setBus(&b);
+    var capture = NativeCallbackCapture{ .allocator = alloc, .observe_bus = &b };
+    defer capture.deinit();
+    const catalog = try DiscordChannel.loadCommandCatalog(alloc);
+    defer catalog.deinit();
+    try std.testing.expectEqual(@as(usize, 52), catalog.value.len);
+    for (catalog.value) |command| {
+        const event = try nativeTestEvent(alloc, command.name, "", native_guild_context);
+        defer event.deinit();
+        try ch.handleInteractionCreateWithCallback(event.value, capture.callback());
+        try std.testing.expectEqual(@as(usize, 1), b.inboundDepth());
+        const msg = b.consumeInbound().?;
+        defer msg.deinit(alloc);
+        const expected = try std.fmt.allocPrint(alloc, "/{s}", .{command.name});
+        defer alloc.free(expected);
+        try std.testing.expectEqualStrings(expected, msg.content);
+        const plan = @import("../agent/commands.zig").planTurnInput(msg.content);
+        try std.testing.expect(plan.invoke_local_handler);
+        try std.testing.expectEqualStrings("thread-9", msg.chat_id);
+        try std.testing.expectEqualStrings("user-9", msg.sender_id);
+        try std.testing.expectEqualStrings("discord:secondary:channel:thread-9", msg.session_key);
+        const metadata = try std.json.parseFromSlice(std.json.Value, alloc, msg.metadata_json.?, .{});
+        defer metadata.deinit();
+        try std.testing.expectEqualStrings("secondary", metadata.value.object.get("account_id").?.string);
+        try std.testing.expectEqualStrings("application_command", metadata.value.object.get("interaction").?.string);
+        try std.testing.expectEqualStrings("guild-9", metadata.value.object.get("guild_id").?.string);
+        try std.testing.expectEqualStrings("neutral-user", metadata.value.object.get("sender_username").?.string);
+        try std.testing.expectEqualStrings("Neutral User", metadata.value.object.get("sender_display_name").?.string);
+        try std.testing.expect(!metadata.value.object.get("is_dm").?.bool);
+        try std.testing.expect(!metadata.value.object.contains("message_id"));
+        try std.testing.expect(!metadata.value.object.contains("replace_message"));
+        try std.testing.expect(std.mem.indexOf(u8, msg.metadata_json.?, "token") == null);
+        const receipt = try std.json.parseFromSlice(std.json.Value, alloc, capture.body.?, .{});
+        defer receipt.deinit();
+        try std.testing.expectEqual(@as(i64, 4), receipt.value.object.get("type").?.integer);
+        const receipt_data = receipt.value.object.get("data").?.object;
+        try std.testing.expectEqual(@as(i64, 64), receipt_data.get("flags").?.integer);
+        const expected_receipt = try std.fmt.allocPrint(alloc, "Received /{s}. Command output appears in this channel.", .{command.name});
+        defer alloc.free(expected_receipt);
+        try std.testing.expectEqualStrings(expected_receipt, receipt_data.get("content").?.string);
+    }
+    try std.testing.expectEqual(@as(usize, 52), capture.calls);
+}
+
+test "discord native args preserve escaped interior text and direct route" {
+    const alloc = std.testing.allocator;
+    var b = bus_mod.Bus.init();
+    defer b.close();
+    var ch = DiscordChannel.initFromConfig(alloc, .{ .token = "test-token", .account_id = "dm-account", .allow_from = &.{"user-9"}, .require_mention = true });
+    ch.setBus(&b);
+    var capture = NativeCallbackCapture{ .allocator = alloc };
+    defer capture.deinit();
+    const catalog = try DiscordChannel.loadCommandCatalog(alloc);
+    defer catalog.deinit();
+    for (catalog.value) |command| {
+        if (command.options.len == 0) continue;
+        const event = try nativeTestEvent(alloc, command.name, ",\"options\":[{\"type\":3,\"name\":\"args\",\"value\":\"  a \\\"quote\\\"\\nback\\\\slash  \"}]", native_dm_context);
+        defer event.deinit();
+        try ch.handleInteractionCreateWithCallback(event.value, capture.callback());
+        const msg = b.consumeInbound().?;
+        defer msg.deinit(alloc);
+        const expected = try std.fmt.allocPrint(alloc, "/{s} a \"quote\"\nback\\slash", .{command.name});
+        defer alloc.free(expected);
+        try std.testing.expectEqualStrings(expected, msg.content);
+        try std.testing.expectEqualStrings("discord:dm-account:direct:user-9", msg.session_key);
+        try std.testing.expectEqualStrings("thread-9", msg.chat_id);
+        try std.testing.expect(std.mem.indexOf(u8, msg.metadata_json.?, "\"is_dm\":true") != null);
+    }
+}
+
+test "discord native rejects malformed options and no args commands" {
+    const alloc = std.testing.allocator;
+    var b = bus_mod.Bus.init();
+    defer b.close();
+    var ch = DiscordChannel.initFromConfig(alloc, .{ .token = "test-token", .allow_from = &.{"user-9"} });
+    ch.setBus(&b);
+    var capture = NativeCallbackCapture{ .allocator = alloc };
+    defer capture.deinit();
+    const invalid_options = [_][]const u8{
+        ",\"options\":null",
+        ",\"options\":{}",
+        ",\"options\":[{}]",
+        ",\"options\":[{\"type\":3,\"name\":\"other\",\"value\":\"x\"}]",
+        ",\"options\":[{\"type\":4,\"name\":\"args\",\"value\":\"x\"}]",
+        ",\"options\":[{\"type\":3,\"name\":\"args\",\"value\":1}]",
+        ",\"options\":[{\"type\":3,\"name\":\"args\",\"value\":\"x\",\"options\":[]}]",
+        ",\"options\":[{\"type\":3,\"name\":\"args\",\"value\":\"x\"},{\"type\":3,\"name\":\"args\",\"value\":\"y\"}]",
+    };
+    for (invalid_options) |options| {
+        const event = try nativeTestEvent(alloc, "model", options, native_guild_context);
+        defer event.deinit();
+        try ch.handleInteractionCreateWithCallback(event.value, capture.callback());
+        try std.testing.expectEqual(@as(usize, 0), b.inboundDepth());
+    }
+    const catalog = try DiscordChannel.loadCommandCatalog(alloc);
+    defer catalog.deinit();
+    for (catalog.value) |command| {
+        if (command.options.len != 0) continue;
+        const event = try nativeTestEvent(alloc, command.name, ",\"options\":[{\"type\":3,\"name\":\"args\",\"value\":\"x\"}]", native_guild_context);
+        defer event.deinit();
+        try ch.handleInteractionCreateWithCallback(event.value, capture.callback());
+        try std.testing.expectEqual(@as(usize, 0), b.inboundDepth());
+    }
+    const unknown = try nativeTestEvent(alloc, "unknown-command", "", native_guild_context);
+    defer unknown.deinit();
+    try ch.handleInteractionCreateWithCallback(unknown.value, capture.callback());
+    try std.testing.expectEqual(@as(usize, 0), b.inboundDepth());
+    try std.testing.expect(std.mem.indexOf(u8, capture.body.?, "unavailable") != null);
+}
+
+test "discord native identity and configured guild reject bypasses" {
+    const alloc = std.testing.allocator;
+    var b = bus_mod.Bus.init();
+    defer b.close();
+    var ch = DiscordChannel.initFromConfig(alloc, .{ .token = "test-token", .guild_id = "guild-9", .allow_from = &.{"user-9"}, .allow_bots = true });
+    ch.setBus(&b);
+    var capture = NativeCallbackCapture{ .allocator = alloc };
+    defer capture.deinit();
+    const contexts = [_][]const u8{
+        native_dm_context,
+        "\"guild_id\":\"other-guild\",\"member\":{\"user\":{\"id\":\"user-9\"}}",
+        "\"guild_id\":\"guild-9\",\"user\":{\"id\":\"user-9\"}",
+        "\"guild_id\":\"guild-9\",\"member\":null,\"user\":{\"id\":\"user-9\"}",
+        "\"guild_id\":\"guild-9\",\"member\":{\"user\":{\"id\":\"other-user\"}},\"user\":{\"id\":\"user-9\"}",
+        "\"guild_id\":\"guild-9\",\"member\":{\"user\":{\"id\":\"user-9\",\"bot\":true}}",
+        "\"guild_id\":\"guild-9\",\"member\":{\"user\":{\"id\":\"user-9\",\"bot\":\"false\"}}",
+        "\"guild_id\":null,\"user\":{\"id\":\"user-9\"}",
+        "\"guild_id\":\"\",\"member\":{\"user\":{\"id\":\"user-9\"}}",
+        "\"guild_id\":\"guild-9\",\"member\":{\"user\":{\"id\":\"\"}}",
+    };
+    for (contexts) |context| {
+        const event = try nativeTestEvent(alloc, "status", "", context);
+        defer event.deinit();
+        try ch.handleInteractionCreateWithCallback(event.value, capture.callback());
+        try std.testing.expectEqual(@as(usize, 0), b.inboundDepth());
+    }
+    ch.guild_id = null;
+    const dm_with_member = try nativeTestEvent(alloc, "status", "", "\"member\":{\"user\":{\"id\":\"user-9\"}} ,\"user\":{\"id\":\"user-9\"}");
+    defer dm_with_member.deinit();
+    try ch.handleInteractionCreateWithCallback(dm_with_member.value, capture.callback());
+    try std.testing.expectEqual(@as(usize, 0), b.inboundDepth());
+    ch.allow_from = &.{};
+    const deny_default = try nativeTestEvent(alloc, "status", "", native_dm_context);
+    defer deny_default.deinit();
+    try ch.handleInteractionCreateWithCallback(deny_default.value, capture.callback());
+    try std.testing.expectEqual(@as(usize, 0), b.inboundDepth());
+}
+
+test "discord native callback failure and shutdown never publish" {
+    // Regression: acknowledging a command must not dispatch it if Discord rejects the receipt.
+    const alloc = std.testing.allocator;
+    var b = bus_mod.Bus.init();
+    defer b.close();
+    var ch = DiscordChannel.initFromConfig(alloc, .{ .token = "test-token", .allow_from = &.{"user-9"} });
+    ch.setBus(&b);
+    const event = try nativeTestEvent(alloc, "status", "", native_dm_context);
+    defer event.deinit();
+    var capture = NativeCallbackCapture{ .allocator = alloc, .fail = true };
+    defer capture.deinit();
+    try std.testing.expectError(error.CallbackFailed, ch.handleInteractionCreateWithCallback(event.value, capture.callback()));
+    try std.testing.expectEqual(@as(usize, 0), b.inboundDepth());
+    capture.fail = false;
+    for ([_][]const u8{ "400", "403", "429", "500", "000", "2000", "2xx" }) |status| {
+        capture.status = status;
+        try std.testing.expectError(error.InteractionCallbackFailed, ch.handleInteractionCreateWithCallback(event.value, capture.callback()));
+        try std.testing.expectEqual(@as(usize, 0), b.inboundDepth());
+    }
+    capture.status = "204";
+    capture.close_bus = &b;
+    try std.testing.expectError(error.Closed, ch.handleInteractionCreateWithCallback(event.value, capture.callback()));
+    try std.testing.expectEqual(@as(usize, 0), b.inboundDepth());
+    const calls = capture.calls;
+    try std.testing.expectError(error.Closed, ch.handleInteractionCreateWithCallback(event.value, capture.callback()));
+    try std.testing.expectEqual(calls, capture.calls);
+    ch.bus = null;
+    try std.testing.expectError(error.NoBus, ch.handleInteractionCreateWithCallback(event.value, capture.callback()));
+    try std.testing.expectEqual(calls, capture.calls);
+}
+
+test "discord native full queue frees prepared message" {
+    const alloc = std.testing.allocator;
+    var b = bus_mod.Bus.init();
+    defer b.close();
+    defer while (b.inboundDepth() > 0) b.consumeInbound().?.deinit(alloc);
+    for (0..bus_mod.QUEUE_CAPACITY) |_| try b.publishInbound(try bus_mod.makeInbound(alloc, "discord", "user", "chat", "filler", "session"));
+    var ch = DiscordChannel.initFromConfig(alloc, .{ .token = "test-token", .allow_from = &.{"user-9"} });
+    ch.setBus(&b);
+    const event = try nativeTestEvent(alloc, "status", "", native_dm_context);
+    defer event.deinit();
+    var capture = NativeCallbackCapture{ .allocator = alloc };
+    defer capture.deinit();
+    try std.testing.expectError(error.Timeout, ch.handleInteractionCreateWithCallback(event.value, capture.callback()));
+    try std.testing.expectEqual(bus_mod.QUEUE_CAPACITY, b.inboundDepth());
+}
+
+fn nativeAllocationFailure(allocator: std.mem.Allocator) !void {
+    var b = bus_mod.Bus.init();
+    defer b.close();
+    defer while (b.inboundDepth() > 0) b.consumeInbound().?.deinit(allocator);
+    var ch = DiscordChannel.initFromConfig(allocator, .{ .token = "test-token", .allow_from = &.{"user-9"} });
+    ch.setBus(&b);
+    const event = try nativeTestEvent(allocator, "model", ",\"options\":[{\"type\":3,\"name\":\"args\",\"value\":\"provider/model\"}]", native_dm_context);
+    defer event.deinit();
+    var capture = NativeCallbackCapture{ .allocator = allocator };
+    defer capture.deinit();
+    try ch.handleInteractionCreateWithCallback(event.value, capture.callback());
+}
+
+test "discord native frees resources under allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, nativeAllocationFailure, .{});
+}
+
+test "discord native rejects unsafe callback config and escapes receipt" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidInteraction, DiscordChannel.nativeCallbackConfig(alloc, "123", "", "{}"));
+    const opaque_config = try DiscordChannel.nativeCallbackConfig(alloc, "123", "opaque+/=:\"\n\\token", "{}");
+    defer alloc.free(opaque_config);
+    try std.testing.expect(std.mem.indexOf(u8, opaque_config, "opaque%2B%2F%3D%3A%22%0A%5Ctoken/callback") != null);
+    try std.testing.expect(std.mem.indexOf(u8, opaque_config, "\n\\token") == null);
+    const receipt = try DiscordChannel.nativeReceipt(alloc, "a \"quote\"\nnext");
+    defer alloc.free(receipt);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, receipt, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("a \"quote\"\nnext", parsed.value.object.get("data").?.object.get("content").?.string);
+    const config = try DiscordChannel.nativeCallbackConfig(alloc, "123", "test-token", receipt);
+    defer alloc.free(config);
+    try std.testing.expect(std.mem.indexOf(u8, config, "max-time = 2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config, "data-binary = \"{\\\"type\\\":4") != null);
+}
+
+test "discord native unsupported event types do not acknowledge or dispatch" {
+    const alloc = std.testing.allocator;
+    var b = bus_mod.Bus.init();
+    defer b.close();
+    var ch = DiscordChannel.init(alloc, "test-token", null, false);
+    ch.setBus(&b);
+    var capture = NativeCallbackCapture{ .allocator = alloc };
+    defer capture.deinit();
+    for ([_][]const u8{ "{\"d\":{}}", "{\"d\":{\"type\":1}}", "{\"d\":{\"type\":\"2\"}}", "{\"d\":{\"type\":4}}" }) |json| {
+        const event = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer event.deinit();
+        try ch.handleInteractionCreateWithCallback(event.value, capture.callback());
+    }
+    try std.testing.expectEqual(@as(usize, 0), capture.calls);
+    try std.testing.expectEqual(@as(usize, 0), b.inboundDepth());
+}
+
+test "discord native validates required fields data kind and argument limit" {
+    const alloc = std.testing.allocator;
+    var b = bus_mod.Bus.init();
+    defer b.close();
+    var ch = DiscordChannel.initFromConfig(alloc, .{ .token = "test-token", .allow_from = &.{"user-9"} });
+    ch.setBus(&b);
+    var capture = NativeCallbackCapture{ .allocator = alloc };
+    defer capture.deinit();
+    for ([_][]const u8{ "id", "token", "channel_id" }) |field| {
+        var event = try nativeTestEvent(alloc, "status", "", native_dm_context);
+        defer event.deinit();
+        const d = &event.value.object.getPtr("d").?.object;
+        _ = d.swapRemove(field);
+        if (std.mem.eql(u8, field, "channel_id")) {
+            try ch.handleInteractionCreateWithCallback(event.value, capture.callback());
+        } else {
+            const calls = capture.calls;
+            try std.testing.expectError(error.InvalidInteraction, ch.handleInteractionCreateWithCallback(event.value, capture.callback()));
+            try std.testing.expectEqual(calls, capture.calls);
+        }
+        try std.testing.expectEqual(@as(usize, 0), b.inboundDepth());
+    }
+    var wrong_kind = try nativeTestEvent(alloc, "status", "", native_dm_context);
+    defer wrong_kind.deinit();
+    wrong_kind.value.object.getPtr("d").?.object.getPtr("data").?.object.getPtr("type").?.* = .{ .integer = 2 };
+    try ch.handleInteractionCreateWithCallback(wrong_kind.value, capture.callback());
+    try std.testing.expectEqual(@as(usize, 0), b.inboundDepth());
+    const oversized_args = try alloc.alloc(u8, DiscordChannel.MAX_MESSAGE_LEN + 1);
+    defer alloc.free(oversized_args);
+    @memset(oversized_args, 'a');
+    const options = try std.fmt.allocPrint(alloc, ",\"options\":[{{\"type\":3,\"name\":\"args\",\"value\":{f}}}]", .{std.json.fmt(oversized_args, .{})});
+    defer alloc.free(options);
+    const oversized = try nativeTestEvent(alloc, "model", options, native_dm_context);
+    defer oversized.deinit();
+    try ch.handleInteractionCreateWithCallback(oversized.value, capture.callback());
+    try std.testing.expectEqual(@as(usize, 0), b.inboundDepth());
+    for ([_][]const u8{ ",\"options\":[]", ",\"options\":[{\"type\":3,\"name\":\"args\",\"value\":\" \\n \\t\"}]" }) |empty_options| {
+        const empty = try nativeTestEvent(alloc, "model", empty_options, native_dm_context);
+        defer empty.deinit();
+        try ch.handleInteractionCreateWithCallback(empty.value, capture.callback());
+        const msg = b.consumeInbound().?;
+        defer msg.deinit(alloc);
+        try std.testing.expectEqualStrings("/model", msg.content);
+    }
 }

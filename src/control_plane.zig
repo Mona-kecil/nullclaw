@@ -58,6 +58,21 @@ pub const HELP_TEXT =
     \\  exit, quit
 ;
 
+pub fn discordHelpText(allocator: std.mem.Allocator) ![]u8 {
+    const Command = struct { name: []const u8, description: []const u8 };
+    const catalog = try std.json.parseFromSlice([]Command, allocator, @embedFile("channels/discord_commands.json"), .{ .ignore_unknown_fields = true });
+    defer catalog.deinit();
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "Discord commands:\n");
+    for (catalog.value) |command| {
+        const line = try std.fmt.allocPrint(allocator, "/{s}  {s}\n", .{ command.name, command.description });
+        defer allocator.free(line);
+        try out.appendSlice(allocator, line);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn appendTelegramBotCommandScope(
     out: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,

@@ -5450,7 +5450,15 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
             }
             return try self.allocator.dupe(u8, "Session restarted.");
         },
-        .help => return try self.allocator.dupe(u8, control_plane.HELP_TEXT),
+        .help => {
+            const context_channel = if (@hasField(@TypeOf(self.*), "conversation_context"))
+                if (self.conversation_context) |ctx| ctx.channel else null
+            else
+                null;
+            const channel = interactiveModelMenuChannel(if (@hasField(@TypeOf(self.*), "memory_session_id")) self.memory_session_id else null, context_channel);
+            if (channel != null and std.mem.eql(u8, channel.?, "discord")) return try control_plane.discordHelpText(self.allocator);
+            return try self.allocator.dupe(u8, control_plane.HELP_TEXT);
+        },
         .status => return try formatStatus(self),
         .whoami => return try formatWhoAmI(self),
         .model => {

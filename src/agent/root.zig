@@ -5705,6 +5705,26 @@ test "slash /help returns help text" {
     try std.testing.expect(std.mem.indexOf(u8, response, "/poll") != null);
 }
 
+test "slash Discord help matches its native catalog" {
+    // Regression: Discord help advertised Telegram commands absent from its menu.
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.conversation_context = .{ .channel = "discord" };
+    const response = (try agent.handleSlashCommand("/help")).?;
+    defer allocator.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/config ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/approve ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/bind ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/topic") == null);
+    var lines = std.mem.splitScalar(u8, response, '\n');
+    var count: usize = 0;
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "/")) count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 52), count);
+}
+
 test "slash /commands aliases to help" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
