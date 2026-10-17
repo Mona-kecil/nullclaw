@@ -1983,13 +1983,13 @@ pub const SessionManager = struct {
     };
 
     /// Return the routing input for a session without acquiring the long turn mutex.
-    /// If the session does not exist yet, returns defaults (process, off, false).
+    /// If the session does not exist yet, returns defaults (process, serial, false).
     pub fn routeInput(self: *SessionManager, session_key: []const u8) inbound_router.RouteInput {
         self.mutex.lock();
         defer self.mutex.unlock();
         const session = self.sessions.get(session_key) orelse return .{
             .turn_running = false,
-            .queue_mode = .off,
+            .queue_mode = .serial,
             .has_pending_injection = false,
         };
         return .{
@@ -4019,6 +4019,10 @@ test "routeInbound handles active session routing side effects" {
     session.turn_running.store(true, .release);
     defer session.turn_running.store(false, .release);
 
+    // Regression: a follow-up arriving during a turn must survive the default busy route.
+    try testing.expectEqual(SessionManager.InboundRouteAction.process, sm.routeInbound(session_key, "follow-up"));
+    try testing.expect(!sm.routeInput(session_key).has_pending_injection);
+
     session.agent.queue_mode = .latest;
     try testing.expectEqual(
         SessionManager.InboundRouteAction.skip,
@@ -4885,73 +4889,58 @@ test "restored session token reconstruction stays aligned across response cache 
     try testing.expectEqual(@as(u64, expected_tokens), restored_session.agent.total_tokens);
 }
 
-fn expectResetTurnPersistsFreshSession(command: []const u8) !void {
+fn expectResetTurnClearsSession(command: []const u8) !void {
     var mock = MockProvider{ .response = "ok" };
     const cfg = testConfig();
-
     var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
     defer sqlite_mem.deinit();
-
     var noop = observability.NoopObserver{};
-    var sm = SessionManager.init(
-        testing.allocator,
-        &cfg,
-        mock.provider(),
-        &.{},
-        sqlite_mem.memory(),
-        noop.observer(),
-        sqlite_mem.sessionStore(),
-        null,
-    );
+    var sm = SessionManager.init(testing.allocator, &cfg, mock.provider(), &.{}, sqlite_mem.memory(), noop.observer(), sqlite_mem.sessionStore(), null);
     defer sm.deinit();
-
-    const session_key = "telegram:main:chat-reset-usage";
-    const store = sqlite_mem.sessionStore();
-
-    const first = try sm.processMessage(session_key, "before reset", .{
-        .channel = "telegram",
-        .is_group = false,
-        .group_id = null,
-    });
+    const session_key = "telegram:main:group:reset";
+    const context = ConversationContext{ .channel = "telegram", .is_group = true, .group_id = "group-reset" };
+    const first = try sm.processMessage(session_key, "before reset", context);
     defer testing.allocator.free(first);
+    try testing.expectEqual(@as(usize, 1), mock.chat_calls);
 
-    const token_cost = @as(u64, agent_mod.estimate_text_tokens("ok"));
-    const session = try sm.getOrCreate(session_key);
-    try testing.expectEqual(token_cost, session.agent.total_tokens);
-
-    const reset_reply = try sm.processMessage(session_key, command, .{
-        .channel = "telegram",
-        .is_group = false,
-        .group_id = null,
-    });
+    // Regression: Telegram reset commands must acknowledge without an LLM turn that can return NO_REPLY.
+    const reset_reply = try sm.processMessage(session_key, command, context);
     defer testing.allocator.free(reset_reply);
-    try testing.expectEqual(token_cost, session.agent.total_tokens);
-
+    try testing.expectEqualStrings("Session cleared.", reset_reply);
+    try testing.expectEqual(@as(usize, 1), mock.chat_calls);
+    const session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(u64, 0), session.agent.total_tokens);
+    try testing.expectEqual(@as(usize, 0), session.agent.historyLen());
+    const store = sqlite_mem.sessionStore();
     const entries = try store.loadMessages(testing.allocator, session_key);
     defer memory_mod.freeMessages(testing.allocator, entries);
-    try testing.expectEqual(@as(usize, 2), entries.len);
-    try testing.expectEqualStrings("user", entries[0].role);
-    try testing.expectEqualStrings(agent_mod.commands.bareSessionResetPrompt(command).?, entries[0].content);
-    try testing.expectEqualStrings("assistant", entries[1].role);
-    try testing.expectEqualStrings("ok", entries[1].content);
-    try testing.expectEqual(@as(?u64, token_cost), try store.loadUsage(session_key));
-
+    try testing.expectEqual(@as(usize, 0), entries.len);
     session.last_active = 0;
     try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
-
     const restored = try sm.getOrCreate(session_key);
-    try testing.expectEqual(token_cost, restored.agent.total_tokens);
-    try testing.expectEqual(@as(usize, 2), restored.agent.historyLen());
-    try testing.expectEqualStrings(entries[0].content, restored.agent.history.items[0].content);
-    try testing.expectEqualStrings("ok", restored.agent.history.items[1].content);
+    try testing.expectEqual(@as(u64, 0), restored.agent.total_tokens);
+    try testing.expectEqual(@as(usize, 0), restored.agent.historyLen());
+
+    const reply = try sm.processInboundMessage(session_key, "hello after reset", context);
+    defer if (reply) |text| testing.allocator.free(text);
+    try testing.expectEqualStrings("ok", reply.?);
+    try testing.expectEqual(@as(usize, 2), mock.chat_calls);
+    const fresh_entries = try store.loadMessages(testing.allocator, session_key);
+    defer memory_mod.freeMessages(testing.allocator, fresh_entries);
+    try testing.expectEqual(@as(usize, 2), fresh_entries.len);
+    try testing.expectEqualStrings("hello after reset", fresh_entries[0].content);
 }
 
-test "processMessage bare /new persists fresh-session turn across reload" {
-    try expectResetTurnPersistsFreshSession("/new");
+test "processMessage bare /new clears session without provider call" {
+    try expectResetTurnClearsSession("/new");
 }
 
-test "processMessage bare /reset with mention persists fresh-session turn across reload" {
-    try expectResetTurnPersistsFreshSession("/reset@nullclaw_bot:");
+test "processMessage bare /new with Telegram mention clears session without provider call" {
+    try expectResetTurnClearsSession("/new@nullclaw_bot");
+}
+
+test "processMessage bare /reset with mention clears session without provider call" {
+    try expectResetTurnClearsSession("/reset@nullclaw_bot:");
 }
 
 test "processMessage slash-prefixed prompt that is not a local command persists across reload" {

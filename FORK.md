@@ -14,6 +14,7 @@ This fork keeps the changes used by Mono. The `mono` branch starts at upstream
 - Send image attachments through the Codex provider as visual input.
 - Enforce Telegram POST deadlines so stalled polls can retry after wake.
 - Allow public research from social channels before approval for protected actions.
+- Acknowledge session resets without a model call and queue follow-up messages by default.
 
 See [Discord command setup](docs/en/discord-native-commands.md).
 

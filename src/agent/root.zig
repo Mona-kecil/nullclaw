@@ -327,7 +327,7 @@ pub const Agent = struct {
     exec_ask: ExecAsk = .on_miss,
     exec_node_id: ?[]const u8 = null,
     exec_node_id_owned: bool = false,
-    queue_mode: QueueMode = .off,
+    queue_mode: QueueMode = .serial,
     queue_debounce_ms: u32 = 0,
     queue_cap: u32 = 0,
     queue_drop: QueueDrop = .summarize,
@@ -1914,18 +1914,10 @@ pub const Agent = struct {
         commands.refreshSubagentToolContext(self);
 
         const turn_input = commands.planTurnInput(user_message);
-        const effective_user_message = blk: {
-            if (turn_input.invoke_local_handler) {
-                const slash_response = (try self.handleSlashCommand(user_message)) orelse return error.SlashCommandDispatchMismatch;
-                if (turn_input.llm_user_message) |llm_user_message| {
-                    // Bare /new and /reset clear session state first, then continue as a fresh LLM turn.
-                    self.allocator.free(slash_response);
-                    break :blk llm_user_message;
-                }
-                return slash_response;
-            }
-            break :blk turn_input.llm_user_message orelse user_message;
-        };
+        if (turn_input.invoke_local_handler) {
+            return (try self.handleSlashCommand(user_message)) orelse error.SlashCommandDispatchMismatch;
+        }
+        const effective_user_message = turn_input.llm_user_message orelse user_message;
         var safe_user_message_owned: ?[]u8 = null;
         defer if (safe_user_message_owned) |msg| self.allocator.free(msg);
         const safe_user_message = if (self.redactor) |r| blk: {
@@ -5214,7 +5206,7 @@ test "slash /reset clears history and switches model" {
     try std.testing.expectEqualStrings("gpt-4o-mini", agent.model_name);
 }
 
-test "turn bare /new routes through fresh-session prompt" {
+test "turn bare /new clears session without provider call" {
     const EchoProvider = struct {
         const Self = @This();
         call_count: usize = 0,
@@ -5298,8 +5290,9 @@ test "turn bare /new routes through fresh-session prompt" {
     const response = try agent.turn("/new");
     defer allocator.free(response);
 
-    try std.testing.expect(std.mem.indexOf(u8, response, "Execute your Session Startup sequence now") != null);
-    try std.testing.expectEqual(@as(usize, 1), provider_state.call_count);
+    try std.testing.expectEqualStrings("Session cleared.", response);
+    try std.testing.expectEqual(@as(usize, 0), provider_state.call_count);
+    try std.testing.expectEqual(@as(usize, 0), agent.historyLen());
 
     for (agent.history.items) |msg| {
         try std.testing.expect(std.mem.indexOf(u8, msg.content, "old-before-reset") == null);
@@ -6528,6 +6521,21 @@ test "slash /queue updates queue settings" {
     try std.testing.expectEqual(@as(u32, 2000), agent.queue_debounce_ms);
     try std.testing.expectEqual(@as(u32, 25), agent.queue_cap);
     try std.testing.expect(agent.queue_drop == .newest);
+}
+
+test "slash queue reset and restart restore serial default while off remains explicit" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    try std.testing.expect(agent.queue_mode == .serial);
+    for ([_][]const u8{ "/queue reset", "/restart" }) |command| {
+        const off_reply = try agent.turn("/queue off");
+        defer allocator.free(off_reply);
+        try std.testing.expect(agent.queue_mode == .off);
+        const reply = try agent.turn(command);
+        defer allocator.free(reply);
+        try std.testing.expect(agent.queue_mode == .serial);
+    }
 }
 
 test "slash /usage updates usage mode" {

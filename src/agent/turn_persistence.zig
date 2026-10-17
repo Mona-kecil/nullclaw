@@ -96,28 +96,12 @@ test "persistTurn clears prior session history on reset" {
     try store.saveMessage("test-cli-session", "user", "old");
     try store.saveMessage("test-cli-session", "assistant", "history");
 
-    var history: std.ArrayListUnmanaged(Agent.OwnedMessage) = .empty;
-    defer {
-        for (history.items) |msg| msg.deinit(allocator);
-        history.deinit(allocator);
-    }
-
-    try history.append(allocator, .{
-        .role = .assistant,
-        .content = try allocator.dupe(u8, "fresh reply"),
-    });
-
-    // Regression: CLI turns with explicit session ids must update the session-store
-    // history tables, not just the memories table, so `history list/show` stays populated.
-    persistTurn(store, .{ .history = history.items, .total_tokens = 7 }, "test-cli-session", "/reset", "fresh reply");
+    // Regression: local resets clear saved history without saving a synthetic greeting turn.
+    persistTurn(store, .{ .history = &.{}, .total_tokens = 0 }, "test-cli-session", "/reset", "Session cleared.");
 
     const detailed = try store.loadMessagesDetailed(allocator, "test-cli-session", 10, 0);
     defer memory_mod.freeDetailedMessages(allocator, detailed);
-    try std.testing.expectEqual(@as(usize, 2), detailed.len);
-    try std.testing.expectEqualStrings("user", detailed[0].role);
-    try std.testing.expectEqualStrings(commands.BARE_SESSION_RESET_PROMPT, detailed[0].content);
-    try std.testing.expectEqualStrings("assistant", detailed[1].role);
-    try std.testing.expectEqualStrings("fresh reply", detailed[1].content);
+    try std.testing.expectEqual(@as(usize, 0), detailed.len);
 }
 
 test "persistTurn falls back to rendered response when assistant history is absent" {
