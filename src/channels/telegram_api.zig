@@ -310,10 +310,42 @@ pub const Client = struct {
     }
 
     fn post(self: Client, allocator: std.mem.Allocator, method: []const u8, body: []const u8, timeout: []const u8) ![]u8 {
-        _ = timeout;
         var url_buf: [512]u8 = undefined;
         const url = try self.apiUrl(&url_buf, method);
-        return root.http_util.httpPostJsonWithProxy(allocator, url, body, &.{}, self.proxy);
+        const env_proxy = if (self.proxy == null) try root.http_util.getProxyFromEnv(allocator) else null;
+        defer if (env_proxy) |proxy| allocator.free(proxy);
+        const proxy = if (self.proxy != null) self.proxy else env_proxy;
+
+        var config: std.Io.Writer.Allocating = .init(allocator);
+        defer config.deinit();
+        try config.writer.print("url = {f}\nrequest = \"POST\"\nheader = \"Content-Type: application/json\"\ndata-binary = {f}\nmax-time = {f}\nconnect-timeout = {f}\nsilent\nwrite-out = \"\\n%{{http_code}}\"\n", .{
+            std.json.fmt(url, .{}), std.json.fmt(body, .{}), std.json.fmt(timeout, .{}), std.json.fmt(timeout, .{}),
+        });
+        if (proxy) |value| try config.writer.print("proxy = {f}\nnoproxy = \"\"\n", .{std.json.fmt(value, .{})});
+
+        // -q suppresses user curl config. Credentials and payload travel only through stdin.
+        var child = std_compat.process.Child.init(&.{ "curl", "-q", "--config", "-" }, allocator);
+        child.stdin_behavior = .Pipe;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Ignore;
+        try child.spawn();
+        defer if (child.term == null) {
+            _ = child.kill() catch {};
+        };
+        try child.stdin.?.writeAll(config.written());
+        child.stdin.?.close();
+        child.stdin = null;
+        const response = try child.stdout.?.readToEndAlloc(allocator, 8 * 1024 * 1024 + 4);
+        errdefer allocator.free(response);
+        const term = try child.wait();
+        switch (term) {
+            .exited => |code| if (code != 0) return root.http_util.mapCurlExitCodeToError(code),
+            else => return error.CurlFailed,
+        }
+        if (response.len < 4 or response[response.len - 4] != '\n') return error.CurlFailed;
+        const status = std.fmt.parseInt(u16, response[response.len - 3 ..], 10) catch return error.CurlFailed;
+        if (status < 200 or status >= 300) return error.HttpStatusError;
+        return allocator.realloc(response, response.len - 4);
     }
 
     fn fileUrl(self: Client, buf: []u8, file_path: []const u8) ![]const u8 {
@@ -475,6 +507,66 @@ test "telegram api client builds method url" {
     var buf: [256]u8 = undefined;
     const url = try client.apiUrl(&buf, "getUpdates");
     try std.testing.expectEqualStrings("https://api.telegram.org/bot123:ABC/getUpdates", url);
+}
+
+test "telegram api post deadline returns before a stalled proxy" {
+    if (comptime @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+    // Regression: ignoring the client deadline lets a stalled poll block channel restart.
+    const Proxy = struct {
+        server: *std_compat.net.Server,
+        accepted: std.atomic.Value(bool) = .init(false),
+        saw_connect: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn serve(self: *@This()) void {
+            const conn = self.server.accept() catch return;
+            defer conn.stream.close();
+            self.accepted.store(true, .release);
+            var buffer: [2048]u8 = undefined;
+            var filled: usize = 0;
+            while (filled < buffer.len) {
+                const n = conn.stream.read(buffer[filled..]) catch return;
+                if (n == 0) return;
+                filled += n;
+                if (std.mem.indexOf(u8, buffer[0..filled], "\r\n\r\n") != null) break;
+            }
+            self.saw_connect.store(std.mem.startsWith(u8, buffer[0..filled], "CONNECT api.telegram.org:443 HTTP/1.1\r\n"), .release);
+            conn.stream.writeAll("HTTP/1.1 200 Connection established\r\n\r\n") catch return;
+            for (0..150) |_| {
+                if (self.release.load(.acquire)) return;
+                std_compat.thread.sleep(20 * std.time.ns_per_ms);
+            }
+        }
+    };
+    const allocator = std.testing.allocator;
+    const address = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try address.listen(.{});
+    defer server.deinit();
+    var proxy = Proxy{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, Proxy.serve, .{&proxy});
+    defer {
+        proxy.release.store(true, .release);
+        if (!proxy.accepted.load(.acquire)) {
+            const conn = std_compat.net.tcpConnectToAddress(server.listen_address) catch null;
+            if (conn) |stream| stream.close();
+        }
+        thread.join();
+    }
+    const proxy_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{server.listen_address.in.getPort()});
+    defer allocator.free(proxy_url);
+    const client = Client{ .allocator = allocator, .bot_token = "test-token", .proxy = proxy_url };
+    const started = std_compat.time.milliTimestamp();
+    const result = client.getUpdates(allocator, "{\"timeout\":0}", "1");
+    const elapsed = std_compat.time.milliTimestamp() - started;
+    if (result) |body| {
+        allocator.free(body);
+        return error.ExpectedTimeout;
+    } else |err| {
+        try std.testing.expectEqual(error.CurlTimeout, err);
+    }
+    try std.testing.expect(proxy.accepted.load(.acquire));
+    try std.testing.expect(proxy.saw_connect.load(.acquire));
+    try std.testing.expect(elapsed < 2500);
 }
 
 test "telegram api responseHasTelegramError matches error payloads" {
