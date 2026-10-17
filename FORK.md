@@ -13,6 +13,7 @@ This fork keeps the changes used by Mono. The `mono` branch starts at upstream
 - Generate Discord help from the same 52-command catalog used for registration.
 - Send image attachments through the Codex provider as visual input.
 - Enforce Telegram POST deadlines so stalled polls can retry after wake.
+- Allow public research from social channels before approval for protected actions.
 
 See [Discord command setup](docs/en/discord-native-commands.md).
 
