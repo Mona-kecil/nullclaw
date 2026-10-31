@@ -651,6 +651,7 @@ fn matchPhone(input: []const u8, pos: usize) ?PhoneMatch {
         }
     }
     if (last_digit_end < input.len and std.ascii.isAlphanumeric(input[last_digit_end])) return null;
+    if (isDateLike(input[pos..last_digit_end])) return null;
     return .{ .start = pos, .end = last_digit_end };
 }
 
@@ -659,6 +660,69 @@ fn firstDigit(input: []const u8) ?u8 {
         if (std.ascii.isDigit(c)) return c;
     }
     return null;
+}
+
+fn isDateLike(raw: []const u8) bool {
+    return hasYmdDatePrefix(raw) or hasDmyDatePrefix(raw);
+}
+
+fn hasYmdDatePrefix(raw: []const u8) bool {
+    if (raw.len < 10) return false;
+    if (raw[4] != '-' or raw[7] != '-') return false;
+    if (!datePrefixTerminated(raw, 10)) return false;
+
+    const year = parseFourDigits(raw[0..4]) orelse return false;
+    const month = parseTwoDigits(raw[5], raw[6]) orelse return false;
+    const day = parseTwoDigits(raw[8], raw[9]) orelse return false;
+    return isPlausibleDate(year, month, day);
+}
+
+fn hasDmyDatePrefix(raw: []const u8) bool {
+    if (raw.len < 10) return false;
+    if (raw[2] != '-' or raw[5] != '-') return false;
+    if (!datePrefixTerminated(raw, 10)) return false;
+
+    const day = parseTwoDigits(raw[0], raw[1]) orelse return false;
+    const month = parseTwoDigits(raw[3], raw[4]) orelse return false;
+    const year = parseFourDigits(raw[6..10]) orelse return false;
+    return isPlausibleDate(year, month, day);
+}
+
+fn datePrefixTerminated(raw: []const u8, prefix_len: usize) bool {
+    return raw.len == prefix_len or raw[prefix_len] == ' ';
+}
+
+fn parseTwoDigits(a: u8, b: u8) ?u8 {
+    if (!std.ascii.isDigit(a) or !std.ascii.isDigit(b)) return null;
+    return (a - '0') * 10 + (b - '0');
+}
+
+fn parseFourDigits(raw: []const u8) ?u16 {
+    if (raw.len != 4) return null;
+    var value: u16 = 0;
+    for (raw) |c| {
+        if (!std.ascii.isDigit(c)) return null;
+        const digit: u16 = @intCast(c - '0');
+        value = value * 10 + digit;
+    }
+    return value;
+}
+
+fn isPlausibleDate(year: u16, month: u8, day: u8) bool {
+    if (year < 1900 or year > 2199) return false;
+    if (month < 1 or month > 12 or day < 1) return false;
+
+    const max_day: u8 = switch (month) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (isLeapYear(year)) 29 else 28,
+        else => return false,
+    };
+    return day <= max_day;
+}
+
+fn isLeapYear(year: u16) bool {
+    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0);
 }
 
 const IdMatch = struct { value_start: usize, value_end: usize };
@@ -1177,6 +1241,70 @@ test "Redactor max_identity_entries bounds placeholder maps" {
     const restored = try r.unredact(allocator, "known [EMAIL_1] capped [EMAIL_0]");
     defer allocator.free(restored);
     try std.testing.expectEqualStrings("known a@b.co capped [EMAIL_0]", restored);
+}
+
+test "Redactor ISO datetime preserved - regression for #944" {
+    // Regression: #944. Prompt timestamps must not be replaced with [PHONE_N].
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{});
+    defer r.deinit();
+    const out = try r.redact(allocator, "Current time: 2026-06-02 20:17 UTC");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("Current time: 2026-06-02 20:17 UTC", out);
+}
+
+test "Redactor ISO datetime DD-MM-YYYY preserved" {
+    // Regression: #944. Locale date/time strings can satisfy the phone heuristic.
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{});
+    defer r.deinit();
+    const out = try r.redact(allocator, "02-06-2026 20:17 UTC");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("02-06-2026 20:17 UTC", out);
+}
+
+test "Redactor full system date string preserved" {
+    // Regression: #944. The full prompt date string must survive redaction.
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{});
+    defer r.deinit();
+    const out = try r.redact(allocator, "Tue Jun 02 2026-06-02 20:17:00 CST 2026");
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "PHONE") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "2026-06-02") != null);
+}
+
+test "Redactor phone still redacted alongside dates" {
+    // Regression: #944 fix must not disable phone matches near date strings.
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{});
+    defer r.deinit();
+    const out = try r.redact(allocator, "at 2026-06-02 20:17 UTC call (202) 555-1234");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("at 2026-06-02 20:17 UTC call [PHONE_1]", out);
+}
+
+test "Redactor cron heartbeat timestamp preserved" {
+    // Regression: #944. Heartbeat timestamps use the same false-positive shape.
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{});
+    defer r.deinit();
+    const out = try r.redact(allocator,
+        \\ Heartbeat from bot at 2026-06-02 20:17 UTC
+    );
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "PHONE") == null);
+}
+
+test "Redactor non-date hyphenated phone heuristic still redacts" {
+    // Regression: date false-positive filtering must not treat every dddd- run
+    // as a date and silently weaken the existing phone heuristic.
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{});
+    defer r.deinit();
+    const out = try r.redact(allocator, "call 1234-567-890 now");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("call [PHONE_1] now", out);
 }
 
 test "matchPlaceholderEnd: covers all kinds and rejects look-alikes" {

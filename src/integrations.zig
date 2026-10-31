@@ -104,6 +104,8 @@ const all_integrations_list = [_]IntegrationEntry{
     .{ .name = "Venice", .description = "Privacy-first inference", .category = .ai_model, .status = .available },
     .{ .name = "NEAR AI Cloud", .description = "OpenAI-compatible inference gateway", .category = .ai_model, .status = .available },
     .{ .name = "Atlas Cloud", .description = "OpenAI-compatible inference gateway", .category = .ai_model, .status = .available },
+    .{ .name = "Evolink", .description = "OpenAI-compatible multi-model gateway", .category = .ai_model, .status = .available },
+    .{ .name = "Eden AI", .description = "EU multi-provider gateway", .category = .ai_model, .status = .available },
     .{ .name = "Vercel AI", .description = "Vercel AI Gateway", .category = .ai_model, .status = .available },
     .{ .name = "Cloudflare AI", .description = "Cloudflare AI Gateway", .category = .ai_model, .status = .available },
     .{ .name = "Moonshot", .description = "Kimi & Kimi Coding", .category = .ai_model, .status = .available },
@@ -236,6 +238,14 @@ test "findIntegration finds Telegram" {
     try std.testing.expect(entry != null);
     try std.testing.expectEqualStrings("Telegram", entry.?.name);
     try std.testing.expectEqual(IntegrationCategory.chat, entry.?.category);
+}
+
+test "findIntegration finds Evolink" {
+    const entry = findIntegration("Evolink");
+    try std.testing.expect(entry != null);
+    try std.testing.expectEqualStrings("Evolink", entry.?.name);
+    try std.testing.expectEqual(IntegrationCategory.ai_model, entry.?.category);
+    try std.testing.expectEqual(IntegrationStatus.available, entry.?.status);
 }
 
 test "findIntegration is case-insensitive" {

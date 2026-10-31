@@ -302,7 +302,7 @@ pub const AutonomyConfig = struct {
 };
 
 pub const DockerRuntimeConfig = struct {
-    image: []const u8 = "alpine:3.20",
+    image: []const u8 = "alpine:3.24",
     network: []const u8 = "none",
     memory_limit_mb: ?u64 = 512,
     cpu_limit: ?f64 = 1.0,
@@ -374,12 +374,46 @@ pub const ToolFilterGroup = struct {
     keywords: []const []const u8 = &.{},
 };
 
+pub const QueueMode = enum {
+    off,
+    serial,
+    latest,
+    debounce,
+
+    pub fn toSlice(self: QueueMode) []const u8 {
+        return switch (self) {
+            .off => "off",
+            .serial => "serial",
+            .latest => "latest",
+            .debounce => "debounce",
+        };
+    }
+
+    pub fn fromSlice(s: []const u8) ?QueueMode {
+        return if (std.ascii.eqlIgnoreCase(s, "off"))
+            .off
+        else if (std.ascii.eqlIgnoreCase(s, "serial"))
+            .serial
+        else if (std.ascii.eqlIgnoreCase(s, "latest"))
+            .latest
+        else if (std.ascii.eqlIgnoreCase(s, "debounce"))
+            .debounce
+        else
+            null;
+    }
+};
+
 pub const AgentConfig = struct {
-    compact_context: bool = false,
+    /// When true (default), history is auto-compacted once it crosses the
+    /// token / message thresholds. Set to false to skip proactive LLM
+    /// summarization while retaining hard trimming and emergency compression.
+    /// Default is true to preserve the historical always-compact behavior.
+    compact_context: bool = true,
     max_tool_iterations: u32 = 1000,
     max_history_messages: u32 = 100,
     parallel_tools: bool = false,
     tool_dispatcher: []const u8 = "auto",
+    default_queue_mode: QueueMode = .serial,
     token_limit: u64 = DEFAULT_AGENT_TOKEN_LIMIT,
     /// Internal parse marker: true only when token_limit is explicitly set in config.
     /// Not serialized; used to distinguish override vs default fallback chain.
@@ -780,14 +814,31 @@ pub const WeComConfig = struct {
 };
 
 pub const WeixinConfig = struct {
+    pub const DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com/";
+
     account_id: []const u8 = "default",
     /// Bot token obtained from iLink QR code login flow.
     token: []const u8 = "",
     /// iLink API base URL (may be region-specific after login redirect).
-    base_url: []const u8 = "https://ilinkai.weixin.qq.com/",
+    base_url: []const u8 = DEFAULT_BASE_URL,
     /// Optional HTTP proxy URL for API requests.
     proxy: ?[]const u8 = null,
     allow_from: []const []const u8 = &.{},
+
+    /// iLink requests carry bot credentials, so plaintext remote endpoints are
+    /// never valid even when they point at a private or loopback address.
+    pub fn isValidBaseUrl(raw: []const u8) bool {
+        if (!ProviderEntry.isValidBaseUrl(raw)) return false;
+        const uri = std.Uri.parse(raw) catch return false;
+        if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return false;
+        if (uri.user != null or uri.password != null) return false;
+        if (uri.port) |port| if (port == 0) return false;
+        return true;
+    }
+
+    pub fn isValidProxyUrl(raw: []const u8) bool {
+        return HttpRequestConfig.isValidProxyUrl(raw);
+    }
 };
 
 pub const SignalConfig = struct {
@@ -1266,6 +1317,7 @@ pub const MemoryConfig = struct {
     /// Profile preset — convenience shortcut for common setups.
     profile: []const u8 = "hybrid_keyword",
     backend: []const u8 = DEFAULT_MEMORY_BACKEND,
+    database_path: []const u8 = "",
     instance_id: []const u8 = "",
     auto_save: bool = true,
     citations: []const u8 = "auto",
@@ -1847,7 +1899,7 @@ pub const McpServerConfig = struct {
     transport: []const u8 = DEFAULT_TRANSPORT,
     command: []const u8 = "",
     url: ?[]const u8 = null,
-    /// Per-request wall clock timeout for HTTP transport. 0 = default.
+    /// Per-request wall clock timeout for HTTP and stdio transports.
     timeout_ms: u32 = 10_000,
     args: []const []const u8 = &.{},
     env: []const McpEnvEntry = &.{},
@@ -1934,6 +1986,12 @@ pub const SessionConfig = struct {
     /// Higher values enable parallel processing across different sessions.
     max_concurrent_tasks: u32 = 4,
 };
+
+// Regression: the default Docker runtime must not point at an unsupported Alpine branch.
+test "DockerRuntimeConfig defaults to supported pinned image" {
+    const cfg = DockerRuntimeConfig{};
+    try std.testing.expectEqualStrings("alpine:3.24", cfg.image);
+}
 
 test "WebConfig defaults" {
     const cfg = WebConfig{};
@@ -2255,4 +2313,24 @@ test "markdown_only profile preserves explicit half-life override" {
 
     // Regression: markdown_only should not clobber an explicit half-life override.
     try std.testing.expectEqual(@as(u32, 0), cfg.search.query.hybrid.temporal_decay.half_life_days);
+}
+
+test "QueueMode parser and serializer cover every mode" {
+    // Regression: config parsing and /queue must share one canonical mapping.
+    const cases = [_]struct {
+        mode: QueueMode,
+        text: []const u8,
+    }{
+        .{ .mode = .off, .text = "off" },
+        .{ .mode = .serial, .text = "serial" },
+        .{ .mode = .latest, .text = "latest" },
+        .{ .mode = .debounce, .text = "debounce" },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqualStrings(case.text, case.mode.toSlice());
+        try std.testing.expectEqual(case.mode, QueueMode.fromSlice(case.text).?);
+    }
+    try std.testing.expectEqual(QueueMode.latest, QueueMode.fromSlice("LATEST").?);
+    try std.testing.expect(QueueMode.fromSlice("lastest") == null);
 }
