@@ -35,7 +35,7 @@ bun scripts/register_discord_commands.mjs --self-test
 zig build -Doptimize=ReleaseSmall -Dversion=2026.5.29-mono
 ```
 
-The last upstream merge passed 7,523 tests with nine skipped and a ReleaseSmall
+The last upstream merge passed 7,524 tests with nine skipped and a ReleaseSmall
 build on macOS arm64. The Discord catalog was verified against the live server.
 
 Keep configuration, credentials, chat databases, and build caches outside Git.

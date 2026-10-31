@@ -406,33 +406,16 @@ pub fn buildPromptSection(
     cfg_opt: ?*const Config,
     runtime_tools: ?[]const Tool,
 ) ![]u8 {
-    const channels_enabled = try collectChannelNames(allocator, cfg_opt, .build_enabled);
-    defer allocator.free(channels_enabled);
-    const channels_disabled = try collectChannelNames(allocator, cfg_opt, .build_disabled);
-    defer allocator.free(channels_disabled);
     const channels_configured = try collectChannelNames(allocator, cfg_opt, .configured);
     defer allocator.free(channels_configured);
-
-    const engines_enabled = try collectMemoryEngineNames(allocator, .build_enabled);
-    defer allocator.free(engines_enabled);
-    const engines_disabled = try collectMemoryEngineNames(allocator, .build_disabled);
-    defer allocator.free(engines_disabled);
 
     const runtime_tool_names = try collectRuntimeToolNames(allocator, cfg_opt, runtime_tools);
     defer allocator.free(runtime_tool_names);
     const optional_disabled = try collectOptionalTools(allocator, cfg_opt, .disabled);
     defer allocator.free(optional_disabled);
 
-    const channels_enabled_s = try joinNames(allocator, channels_enabled);
-    defer allocator.free(channels_enabled_s);
-    const channels_disabled_s = try joinNames(allocator, channels_disabled);
-    defer allocator.free(channels_disabled_s);
     const channels_configured_s = try joinNames(allocator, channels_configured);
     defer allocator.free(channels_configured_s);
-    const engines_enabled_s = try joinNames(allocator, engines_enabled);
-    defer allocator.free(engines_enabled_s);
-    const engines_disabled_s = try joinNames(allocator, engines_disabled);
-    defer allocator.free(engines_disabled_s);
     const runtime_tools_s = try joinNames(allocator, runtime_tool_names);
     defer allocator.free(runtime_tools_s);
     const optional_disabled_s = try joinNames(allocator, optional_disabled);
@@ -448,24 +431,16 @@ pub fn buildPromptSection(
         allocator,
         "## Runtime Capabilities\n\n" ++
             "### Available in this runtime\n" ++
-            "- Channels enabled in build: {s}\n" ++
             "- Configured channels: {s}\n" ++
-            "- Memory backends enabled in build: {s}\n" ++
             "- Active memory backend: {s}\n" ++
             "- {s}: {s}\n\n" ++
             "### Not available in this runtime\n" ++
-            "- Channels disabled in build: {s}\n" ++
-            "- Memory backends disabled in build: {s}\n" ++
             "- Optional tools disabled by current config: {s}\n\n",
         .{
-            channels_enabled_s,
             channels_configured_s,
-            engines_enabled_s,
             active_backend,
             tools_line,
             runtime_tools_s,
-            channels_disabled_s,
-            engines_disabled_s,
             optional_disabled_s,
         },
     );
@@ -482,6 +457,17 @@ test "buildManifestJson emits core sections" {
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"file_append\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"file_read_hashed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"file_edit_hashed\"") != null);
+}
+
+test "prompt capabilities omit build-wide channel and backend inventories" {
+    // Regression: unconfigured build features should not clutter the agent prompt.
+    const section = try buildPromptSection(std.testing.allocator, null, null);
+    defer std.testing.allocator.free(section);
+
+    try std.testing.expect(std.mem.indexOf(u8, section, "Configured channels:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, section, "Active memory backend:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, section, "enabled in build:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, section, "disabled in build:") == null);
 }
 
 test "buildManifestJson includes runtime_loaded when runtime tools are unavailable" {
