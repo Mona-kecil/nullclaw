@@ -629,7 +629,7 @@ pub const Agent = struct {
             .token_limit_override = token_limit_override,
             .max_tokens = resolved_max_tokens,
             .max_tokens_override = cfg.max_tokens,
-            .reasoning_effort = cfg.reasoning_effort,
+            .reasoning_effort = if (profile) |p| p.reasoning_effort orelse cfg.reasoning_effort else cfg.reasoning_effort,
             .status_show_emojis = cfg.agent.status_show_emojis,
             .message_timeout_secs = cfg.agent.message_timeout_secs,
             .log_tool_calls = cfg.diagnostics.log_tool_calls,
@@ -4711,6 +4711,7 @@ test "Agent.fromConfigWithProfile applies named profile defaults" {
         .config_path = "/tmp/yc/config.json",
         .default_provider = "openrouter",
         .default_model = "openrouter/default-model",
+        .reasoning_effort = "high",
         .allocator = allocator,
         .model_routes = &.{
             .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-8b" },
@@ -4721,6 +4722,7 @@ test "Agent.fromConfigWithProfile applies named profile defaults" {
         .name = "coder",
         .provider = "ollama",
         .model = "qwen2.5-coder:14b",
+        .reasoning_effort = "xhigh",
         .system_prompt = "You are a coding specialist.",
         .temperature = 0.2,
     };
@@ -4730,6 +4732,7 @@ test "Agent.fromConfigWithProfile applies named profile defaults" {
     defer agent.deinit();
 
     try std.testing.expectEqualStrings("qwen2.5-coder:14b", agent.model_name);
+    try std.testing.expectEqualStrings("xhigh", agent.reasoning_effort.?);
     try std.testing.expectEqualStrings("ollama", agent.default_provider);
     try std.testing.expectEqualStrings("qwen2.5-coder:14b", agent.default_model);
     try std.testing.expectEqualStrings("coder", agent.profile_name.?);

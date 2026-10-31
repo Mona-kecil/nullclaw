@@ -26,6 +26,7 @@ const TestCompleteFn = *const fn (
     system_prompt: []const u8,
     prompt: []const u8,
     temperature: f64,
+    reasoning_effort: ?[]const u8,
 ) anyerror![]const u8;
 
 var test_complete_agent_prompt_override: ?TestCompleteFn = null;
@@ -131,6 +132,7 @@ pub const DelegateTool = struct {
                 sys_prompt,
                 full_prompt,
                 ac.temperature orelse @as(f64, 0.7),
+                ac.reasoning_effort,
             ) catch |err| {
                 const msg = std.fmt.allocPrint(
                     allocator,
@@ -177,6 +179,7 @@ pub const DelegateTool = struct {
             fallback_system_prompt,
             full_prompt,
             cfg.temperature,
+            null,
         ) catch |err| {
             const msg = std.fmt.allocPrint(
                 allocator,
@@ -218,6 +221,7 @@ pub const DelegateTool = struct {
         system_prompt: []const u8,
         prompt: []const u8,
         temperature: f64,
+        reasoning_effort: ?[]const u8,
     ) ![]const u8 {
         if (builtin.is_test) {
             if (test_complete_agent_prompt_override) |override| {
@@ -236,6 +240,7 @@ pub const DelegateTool = struct {
                     system_prompt,
                     prompt,
                     temperature,
+                    reasoning_effort,
                 );
             }
         }
@@ -252,12 +257,14 @@ pub const DelegateTool = struct {
             extra_body_params,
         );
         defer provider_holder.deinit();
-        return provider_holder.provider().chatWithSystem(
+        return providers.chatWithSystemEffort(
+            provider_holder.provider(),
             allocator,
             system_prompt,
             prompt,
             model,
             temperature,
+            reasoning_effort,
         );
     }
 };
@@ -275,6 +282,7 @@ var test_expected_extra_body_params: ?[]const u8 = null;
 var test_expected_model_name: ?[]const u8 = null;
 var test_expected_system_prompt: ?[]const u8 = null;
 var test_expected_prompt: ?[]const u8 = null;
+var test_expected_reasoning_effort: ?[]const u8 = null;
 
 fn testCompleteAgentPrompt(
     allocator: std.mem.Allocator,
@@ -291,7 +299,9 @@ fn testCompleteAgentPrompt(
     system_prompt: []const u8,
     prompt: []const u8,
     temperature: f64,
+    reasoning_effort: ?[]const u8,
 ) ![]const u8 {
+    if (test_expected_reasoning_effort) |expected| try std.testing.expectEqualStrings(expected, reasoning_effort.?);
     try std.testing.expectApproxEqAbs(@as(f64, 0.7), temperature, 0.000001);
     if (test_expected_provider_name) |expected| {
         try std.testing.expectEqualStrings(expected, provider_name);
@@ -580,15 +590,17 @@ test "delegate uses parsed agent model.primary provider ref" {
     test_expected_model_name = "mock-model";
     test_expected_system_prompt = "You are a coder.";
     test_expected_prompt = "Fix it";
+    test_expected_reasoning_effort = "xhigh";
     defer {
         test_expected_provider_name = null;
         test_expected_model_name = null;
         test_expected_system_prompt = null;
         test_expected_prompt = null;
+        test_expected_reasoning_effort = null;
     }
 
     const json =
-        \\{"agents":{"list":[{"id":"coder","model":{"primary":"custom:http://127.0.0.1:11434/v1/mock-model"},"system_prompt":"You are a coder."}]}}
+        \\{"agents":{"list":[{"id":"coder","model":{"primary":"custom:http://127.0.0.1:11434/v1/mock-model"},"system_prompt":"You are a coder.","reasoning_effort":"xhigh"}]}}
     ;
 
     var cfg = Config{
@@ -602,6 +614,7 @@ test "delegate uses parsed agent model.primary provider ref" {
             allocator.free(cfg.agents[0].name);
             allocator.free(cfg.agents[0].provider);
             allocator.free(cfg.agents[0].model);
+            if (cfg.agents[0].reasoning_effort) |effort| allocator.free(effort);
             if (cfg.agents[0].system_prompt) |sp| allocator.free(sp);
             allocator.free(cfg.agents);
         }

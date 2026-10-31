@@ -1823,6 +1823,7 @@ pub const NamedAgentConfig = struct {
     name: []const u8,
     provider: []const u8,
     model: []const u8,
+    reasoning_effort: ?[]const u8 = null,
     system_prompt: ?[]const u8 = null,
     /// Runtime-only source path preserved so Config.save() can round-trip file-backed prompts.
     system_prompt_path: ?[]const u8 = null,

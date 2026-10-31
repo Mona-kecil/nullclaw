@@ -112,6 +112,7 @@ pub fn runTaskWithTools(
         .default_provider = request.default_provider,
         .default_model = effective_model,
         .default_temperature = request.temperature,
+        .reasoning_effort = request.reasoning_effort,
         .providers = request.configured_providers,
         .memory = request.memory_config,
         .memory_backend = request.memory_config.backend,
