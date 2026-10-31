@@ -367,6 +367,26 @@ Notes:
 - Failover order for bare model refs: primary provider first, then each listed `fallback_provider`.
 - Provider-qualified fallback refs such as `openai/gpt-4o` route directly to that provider and skip the generic provider fanout.
 - `api_keys`: (Optional) List of extra API keys for rotation on rate-limit (429) errors.
+### `operator_identity`
+
+Configure the operator's name and platform identities separately from channel
+allowlists. When an incoming Discord ID or Telegram username matches, the agent's
+conversation context identifies that sender as the operator. Other allowed senders
+do not receive that designation.
+
+```json
+"operator_identity": {
+  "name": "User A",
+  "discord_id": "123456789",
+  "telegram_username": "user_a"
+}
+```
+
+Omit an identifier to disable operator matching for that platform. Telegram
+usernames can change or be reassigned. This designation informs the model; it
+does not grant tool permissions or replace approval mechanisms. Group replies
+remain visible to the group.
+
 ### `identity` (AIEOS v1.1)
 
 Use this section when you want the runtime identity to come from an AIEOS document.

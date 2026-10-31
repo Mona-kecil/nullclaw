@@ -1959,10 +1959,17 @@ pub const Agent = struct {
         }
 
         const turn_has_conversation_context = self.conversation_context != null;
-        const turn_conversation_context_fingerprint = if (self.conversation_context) |ctx|
-            ctx.senderFingerprint()
-        else
-            null;
+        const turn_conversation_context_fingerprint: ?u64 = if (self.conversation_context) |ctx| blk: {
+            var hash = std.hash.Wyhash.init(ctx.senderFingerprint());
+            if (cfg_for_prompt_ptr) |cfg| {
+                hash.update(cfg.operator_identity.name);
+                hash.update(&.{0});
+                hash.update(cfg.operator_identity.discord_id);
+                hash.update(&.{0});
+                hash.update(cfg.operator_identity.telegram_username);
+            }
+            break :blk hash.final();
+        } else null;
         const conversation_context_changed = self.has_system_prompt and
             (self.system_prompt_has_conversation_context != turn_has_conversation_context or
                 self.system_prompt_conversation_context_fingerprint != turn_conversation_context_fingerprint);
@@ -1984,6 +1991,7 @@ pub const Agent = struct {
                 .conversation_context = self.conversation_context,
                 .bootstrap_provider = self.bootstrap,
                 .identity_config = if (cfg_for_prompt_ptr) |cfg| cfg.identity else null,
+                .operator_identity = if (cfg_for_prompt_ptr) |cfg| cfg.operator_identity else .{},
                 .observer = self.observer,
             });
             const active_skill_section = try commands.buildActiveSkillPromptSection(self);

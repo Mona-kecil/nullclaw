@@ -106,6 +106,8 @@ pub const InboundDebouncer = struct {
     fn findPendingIndex(self: *const InboundDebouncer, msg: bus.InboundMessage) ?usize {
         for (self.pending.items, 0..) |entry, idx| {
             if (std.mem.eql(u8, entry.msg.session_key, msg.session_key) and
+                std.mem.eql(u8, entry.msg.channel, msg.channel) and
+                entry.msg.trusted_sender == msg.trusted_sender and
                 std.mem.eql(u8, entry.msg.sender_id, msg.sender_id))
             {
                 return idx;
@@ -117,6 +119,26 @@ pub const InboundDebouncer = struct {
 
 pub fn nowMs() i64 {
     return std_compat.time.milliTimestamp();
+}
+
+test "inbound debouncer keeps untrusted messages separate from trusted sender" {
+    const allocator = std.testing.allocator;
+    var debouncer = InboundDebouncer.init(allocator, 3000);
+    defer debouncer.deinit();
+    var out: std.ArrayListUnmanaged(bus.InboundMessage) = .empty;
+    defer {
+        for (out.items) |msg| msg.deinit(allocator);
+        out.deinit(allocator);
+    }
+    var trusted = try bus.makeInbound(allocator, "discord", "user_a", "room", "trusted", "session");
+    trusted.trusted_sender = true;
+    try debouncer.push(trusted, 1000, &out);
+    // Regression: a forged webhook sender must not merge into an operator's turn.
+    try debouncer.push(try bus.makeInbound(allocator, "discord", "user_a", "room", "forged", "session"), 1001, &out);
+    try debouncer.flushAll(&out);
+    try std.testing.expectEqual(@as(usize, 2), out.items.len);
+    try std.testing.expect(out.items[0].trusted_sender);
+    try std.testing.expect(!out.items[1].trusted_sender);
 }
 
 fn isDebounceEligible(msg: bus.InboundMessage) bool {

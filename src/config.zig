@@ -240,6 +240,7 @@ pub const Config = struct {
     browser: BrowserConfig = .{},
     http_request: HttpRequestConfig = .{},
     identity: IdentityConfig = .{},
+    operator_identity: config_types.OperatorIdentityConfig = .{},
     cost: CostConfig = .{},
     peripherals: PeripheralsConfig = .{},
     hardware: HardwareConfig = .{},
@@ -1454,6 +1455,7 @@ pub const Config = struct {
             .search_fallback_providers = self.http_request.search_fallback_providers,
         }, ",\n");
         try writePrettyField(self.allocator, w, "  ", "identity", self.identity, ",\n");
+        try writePrettyField(self.allocator, w, "  ", "operator_identity", self.operator_identity, ",\n");
         try writePrettyField(self.allocator, w, "  ", "cost", self.cost, ",\n");
         try writePrettyField(self.allocator, w, "  ", "security", .{
             .sandbox = .{
@@ -7787,6 +7789,18 @@ test "session config: parse claim gate settings" {
     try std.testing.expectEqual(@as(u32, 120), cfg.session.claim_lockout_secs);
     allocator.free(cfg.session.claim_secret.?);
     allocator.free(cfg.session.claim_admin_secret.?);
+}
+
+test "operator identity config parses configured senders" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson("{\"operator_identity\":{\"name\":\"User A\",\"discord_id\":\"1234\",\"telegram_username\":\"user_a\"}}");
+    defer allocator.free(cfg.operator_identity.name);
+    defer allocator.free(cfg.operator_identity.discord_id);
+    defer allocator.free(cfg.operator_identity.telegram_username);
+    try std.testing.expectEqualStrings("User A", cfg.operator_identity.name);
+    try std.testing.expectEqualStrings("1234", cfg.operator_identity.discord_id);
+    try std.testing.expectEqualStrings("user_a", cfg.operator_identity.telegram_username);
 }
 
 test "session config: parse identity_links map format" {

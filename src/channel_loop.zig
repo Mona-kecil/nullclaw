@@ -728,10 +728,13 @@ fn telegramConversationContext(
     account_id: []const u8,
     sender: []const u8,
     is_group: bool,
+    sender_identity: []const u8,
 ) ?ConversationContext {
     return buildConversationContext(.{
         .channel = "telegram",
         .account_id = account_id,
+        .sender_id = sender_identity,
+        .trusted_sender = true,
         .delivery_chat_id = sender,
         .peer_id = sender,
         .is_group = is_group,
@@ -750,7 +753,7 @@ fn handleTelegramInteractiveCallback(
     is_group: bool,
     message_sender_id: []const u8,
 ) bool {
-    const conversation_context = telegramConversationContext(tg_ptr.account_id, sender, is_group);
+    const conversation_context = telegramConversationContext(tg_ptr.account_id, sender, is_group, message_sender_id);
 
     var response_owned = false;
     const response = blk: {
@@ -965,7 +968,7 @@ fn processTelegramMessage(
     defer setScheduleToolContext(runtime.tools, null, null, null, null, null, null);
 
     // Build conversation context for Telegram
-    const conversation_context = telegramConversationContext(tg_ptr.account_id, sender, is_group);
+    const conversation_context = telegramConversationContext(tg_ptr.account_id, sender, is_group, message_sender_id);
 
     var stream_ctx = telegram.TelegramChannel.StreamCtx{
         .tg_ptr = tg_ptr,
@@ -3005,12 +3008,15 @@ test "buildTelegramBindingStatusReply distinguishes exact and inherited peer bin
 }
 
 test "telegramConversationContext keeps delivery target for callback-driven topic sessions" {
-    const context = telegramConversationContext("main", "-100123#topic:77", true) orelse return error.TestUnexpectedResult;
+    const context = telegramConversationContext("main", "-100123#topic:77", true, "user_a") orelse return error.TestUnexpectedResult;
 
     // Regression: Telegram button callbacks must keep the outbound delivery target,
     // or scheduled/tool-driven follow-ups can route to the session peer only.
     try std.testing.expectEqualStrings("telegram", context.channel.?);
     try std.testing.expectEqualStrings("main", context.account_id.?);
+    // Regression: Telegram sender identity was omitted from the agent context.
+    try std.testing.expectEqualStrings("user_a", context.sender_id.?);
+    try std.testing.expect(context.trusted_sender);
     try std.testing.expectEqualStrings("-100123#topic:77", context.delivery_chat_id.?);
     try std.testing.expectEqualStrings("-100123#topic:77", context.peer_id.?);
     try std.testing.expectEqualStrings("-100123#topic:77", context.group_id.?);

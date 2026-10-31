@@ -1907,6 +1907,12 @@ pub const DmScope = enum {
     per_account_channel_peer,
 };
 
+pub const OperatorIdentityConfig = struct {
+    name: []const u8 = "",
+    discord_id: []const u8 = "",
+    telegram_username: []const u8 = "",
+};
+
 pub const IdentityLink = struct {
     canonical: []const u8,
     peers: []const []const u8 = &.{},

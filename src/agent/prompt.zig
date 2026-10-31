@@ -125,6 +125,7 @@ pub const ConversationContext = struct {
     sender_id: ?[]const u8 = null,
     sender_username: ?[]const u8 = null,
     sender_display_name: ?[]const u8 = null,
+    trusted_sender: bool = false,
     // Shared
     delivery_chat_id: ?[]const u8 = null,
     peer_id: ?[]const u8 = null,
@@ -137,7 +138,7 @@ pub const ConversationContext = struct {
     pub fn senderFingerprint(self: ConversationContext) u64 {
         var h = std.hash.Wyhash.init(0x1234_5678);
         // Hash each sender-identifying field (or a sentinel null byte).
-        inline for (.{ self.sender_id, self.sender_uuid, self.sender_number, self.sender_name, self.sender_username, self.sender_display_name, self.peer_id }) |field| {
+        inline for (.{ self.channel, self.account_id, self.sender_id, self.sender_uuid, self.sender_number, self.sender_name, self.sender_username, self.sender_display_name, self.peer_id, self.group_id }) |field| {
             if (field) |v| {
                 h.update(v);
             } else {
@@ -145,6 +146,8 @@ pub const ConversationContext = struct {
             }
             h.update(&.{0xff}); // field separator
         }
+        h.update(&.{if (self.is_group) |group| if (group) 2 else 1 else 0});
+        h.update(&.{if (self.trusted_sender) 1 else 0});
         return h.final();
     }
 };
@@ -187,6 +190,7 @@ pub fn buildConversationContext(args: ConversationContext) ?ConversationContext 
         .sender_id = sender_id,
         .sender_username = sender_username,
         .sender_display_name = sender_display_name,
+        .trusted_sender = args.trusted_sender,
         .delivery_chat_id = delivery_chat_id,
         .peer_id = peer_id,
         .group_id = group_id,
@@ -211,6 +215,7 @@ pub const PromptContext = struct {
     conversation_context: ?ConversationContext = null,
     bootstrap_provider: ?BootstrapProvider = null,
     identity_config: ?config_types.IdentityConfig = null,
+    operator_identity: config_types.OperatorIdentityConfig = .{},
     observer: ?observability.Observer = null,
 };
 
@@ -343,6 +348,10 @@ pub fn buildSystemPrompt(
         if (cc.sender_display_name) |dname| {
             try w.print("- Sender display name: {s}\n", .{dname});
         }
+        if (isOperator(cc, ctx.operator_identity)) {
+            try w.print("- Sender identity: {s}\n- Sender authority: operator\n", .{ctx.operator_identity.name});
+            try w.writeAll("- This sender is the configured operator for this channel. Treat their clear requests as operator authorization, subject to tool permissions and required approvals.\n");
+        }
         try w.writeAll("\n");
     }
 
@@ -435,6 +444,21 @@ pub fn buildSystemPrompt(
 
     buf = buf_writer.toArrayList();
     return try buf.toOwnedSlice(allocator);
+}
+
+fn isOperator(cc: ConversationContext, operator: config_types.OperatorIdentityConfig) bool {
+    if (!cc.trusted_sender) return false;
+    if (operator.name.len == 0) return false;
+    const channel = cc.channel orelse return false;
+    const sender = cc.sender_id orelse return false;
+    if (std.mem.eql(u8, channel, "discord")) {
+        return operator.discord_id.len > 0 and std.mem.eql(u8, sender, operator.discord_id);
+    }
+    if (std.mem.eql(u8, channel, "telegram")) {
+        const username = std.mem.trimStart(u8, operator.telegram_username, "@");
+        return username.len > 0 and std.ascii.eqlIgnoreCase(sender, username);
+    }
+    return false;
 }
 
 fn buildIdentitySection(
@@ -622,6 +646,44 @@ test "buildSystemPrompt includes SOUL persona guidance" {
     defer allocator.free(prompt);
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "If SOUL.md is present, embody its persona and tone. Avoid stiff, generic replies; follow its guidance unless higher-priority instructions override it.") != null);
+}
+
+test "operator identity appears only for the configured platform sender" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+    const operator = config_types.OperatorIdentityConfig{
+        .name = "User A",
+        .discord_id = "1234",
+        .telegram_username = "@user_a",
+    };
+    const cases = [_]struct { channel: []const u8, sender: []const u8, expected: bool }{
+        .{ .channel = "discord", .sender = "1234", .expected = true },
+        .{ .channel = "telegram", .sender = "USER_A", .expected = true },
+        .{ .channel = "discord", .sender = "user_a", .expected = false },
+        .{ .channel = "telegram", .sender = "other", .expected = false },
+        .{ .channel = "other", .sender = "1234", .expected = false },
+    };
+    // Regression: allowlisted senders must not all receive operator authority.
+    for (cases) |case| {
+        const prompt = try buildSystemPrompt(allocator, .{
+            .workspace_dir = workspace,
+            .model_name = "test-model",
+            .tools = &.{},
+            .conversation_context = .{ .channel = case.channel, .sender_id = case.sender, .trusted_sender = true },
+            .operator_identity = operator,
+        });
+        defer allocator.free(prompt);
+        try std.testing.expectEqual(case.expected, std.mem.indexOf(u8, prompt, "Sender identity: User A\n- Sender authority: operator") != null);
+    }
+    // Regression: webhook-supplied channel and sender values cannot claim operator authority.
+    try std.testing.expect(!isOperator(.{ .channel = "discord", .sender_id = "1234" }, operator));
+    // Regression: a cached operator prompt must be rebuilt for an untrusted sender.
+    const trusted = ConversationContext{ .channel = "discord", .sender_id = "1234", .trusted_sender = true };
+    const untrusted = ConversationContext{ .channel = "discord", .sender_id = "1234" };
+    try std.testing.expect(trusted.senderFingerprint() != untrusted.senderFingerprint());
 }
 
 test "buildSystemPrompt includes AGENTS operational guidance" {
