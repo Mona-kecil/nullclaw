@@ -2,6 +2,10 @@
 # pre-push: run the full test suite before pushing.
 # Activate: git config core.hooksPath .githooks
 
+# Git exports GIT_DIR and related variables to hooks. Without this, tests that
+# run git in temporary directories operate on this repository instead.
+unset $(git rev-parse --local-env-vars)
+
 echo "Running tests..."
 zig build test --summary all 2>&1
 if [ $? -ne 0 ]; then
