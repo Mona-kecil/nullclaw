@@ -1490,7 +1490,7 @@ pub const DiscordChannel = struct {
         try mw.writeByte('}');
         metadata_buf = metadata_writer.toArrayList();
 
-        const msg = try bus_mod.makeInboundFull(
+        var msg = try bus_mod.makeInboundFull(
             self.allocator,
             "discord",
             author_id,
@@ -1500,6 +1500,7 @@ pub const DiscordChannel = struct {
             &.{},
             metadata_buf.items,
         );
+        msg.trusted_sender = true;
 
         if (self.bus) |b| {
             b.publishInbound(msg) catch |err| {
@@ -1878,7 +1879,7 @@ pub const DiscordChannel = struct {
                 try mw.writeByte('}');
                 metadata_buf = metadata_writer.toArrayList();
 
-                const msg = try bus_mod.makeInboundFull(
+                var msg = try bus_mod.makeInboundFull(
                     self.allocator,
                     "discord",
                     user_id,
@@ -1888,6 +1889,7 @@ pub const DiscordChannel = struct {
                     &.{},
                     metadata_buf.items,
                 );
+                msg.trusted_sender = true;
                 if (self.bus) |b| {
                     b.publishInbound(msg) catch |err| {
                         log.warn("Discord: failed to publish interaction message: {}", .{err});
@@ -2159,6 +2161,8 @@ test "discord handleMessageCreate publishes inbound guild message with metadata"
     defer msg.deinit(alloc);
     try std.testing.expectEqualStrings("discord", msg.channel);
     try std.testing.expectEqualStrings("u-1", msg.sender_id);
+    // Regression: only platform-authenticated events may carry operator provenance.
+    try std.testing.expect(msg.trusted_sender);
     try std.testing.expectEqualStrings("c-1", msg.chat_id);
     try std.testing.expectEqualStrings("hello", msg.content);
     try std.testing.expectEqualStrings("discord:dc-main:channel:c-1", msg.session_key);

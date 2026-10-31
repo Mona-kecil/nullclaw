@@ -9,6 +9,7 @@ upstream `main` at commit `5f1cade05c19b6ecdfb9565ae3305e892e484da9`.
 
 ## Local changes
 
+- Allow the verified Discord operator to manage channels in one configured server.
 - Bound Discord typing requests so cleanup cannot stall later replies.
 - Accept native Discord commands through the existing session and access checks.
 - Generate Discord help from the same 52-command catalog used for registration.
@@ -34,7 +35,7 @@ bun scripts/register_discord_commands.mjs --self-test
 zig build -Doptimize=ReleaseSmall -Dversion=2026.5.29-mono
 ```
 
-The last upstream merge passed 7,509 tests with nine skipped and a ReleaseSmall
+The last upstream merge passed 7,523 tests with nine skipped and a ReleaseSmall
 build on macOS arm64. The Discord catalog was verified against the live server.
 
 Keep configuration, credentials, chat databases, and build caches outside Git.

@@ -2522,6 +2522,20 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
+    if (root.get("operator_identity")) |operator| {
+        if (operator == .object) {
+            if (operator.object.get("name")) |v| {
+                if (v == .string) self.operator_identity.name = try self.allocator.dupe(u8, v.string);
+            }
+            if (operator.object.get("discord_id")) |v| {
+                if (v == .string) self.operator_identity.discord_id = try self.allocator.dupe(u8, v.string);
+            }
+            if (operator.object.get("telegram_username")) |v| {
+                if (v == .string) self.operator_identity.telegram_username = try self.allocator.dupe(u8, v.string);
+            }
+        }
+    }
+
     // Composio
     if (root.get("composio")) |comp| {
         if (comp == .object) {

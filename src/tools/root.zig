@@ -74,6 +74,20 @@ pub fn parseTestArgs(json_str: []const u8) !std.json.Parsed(JsonValue) {
     return std.json.parseFromSlice(JsonValue, std.testing.allocator, json_str, .{});
 }
 
+pub const TrustedSender = struct { channel: []const u8, sender_id: []const u8 };
+// This identity is supplied by the runtime, never by tool arguments.
+threadlocal var tls_trusted_sender: ?TrustedSender = null;
+
+pub fn setThreadTrustedSender(sender: ?TrustedSender) ?TrustedSender {
+    const previous = tls_trusted_sender;
+    tls_trusted_sender = sender;
+    return previous;
+}
+
+pub fn threadTrustedSender() ?TrustedSender {
+    return tls_trusted_sender;
+}
+
 threadlocal var tls_memory_session_id: ?[]const u8 = null;
 
 pub fn setThreadMemorySessionId(session_id: ?[]const u8) ?[]const u8 {
@@ -100,6 +114,7 @@ pub fn threadApprovedExecCommand() ?[]const u8 {
 }
 
 // Sub-modules
+pub const discord_manage = @import("discord_manage.zig");
 pub const shell = @import("shell.zig");
 pub const file_read = @import("file_read.zig");
 pub const file_write = @import("file_write.zig");
@@ -358,6 +373,7 @@ pub fn allTools(
     allocator: std.mem.Allocator,
     workspace_dir: []const u8,
     opts: struct {
+        discord_manage_binding: ?discord_manage.Binding = null,
         http_enabled: bool = false,
         http_allowed_domains: []const []const u8 = &.{},
         http_max_response_size: u32 = 1_000_000,
@@ -619,6 +635,15 @@ pub fn allTools(
         for (mcp_tools) |t| {
             try list.append(allocator, t);
         }
+    }
+
+    if (opts.discord_manage_binding) |binding| {
+        const discord_tool = try allocator.create(discord_manage.DiscordManageTool);
+        discord_tool.* = .{ .binding = binding };
+        list.append(allocator, discord_tool.tool()) catch |err| {
+            allocator.destroy(discord_tool);
+            return err;
+        };
     }
 
     applyToolCustomizations(allocator, &list, opts.tools_config.tool_customizations);
@@ -1515,4 +1540,28 @@ test "all tools wires anonymize_text and end-to-end redacts an email" {
 
 test {
     @import("std").testing.refAllDecls(@This());
+}
+
+test "discord manage factory requires binding and excludes subagents" {
+    const a = std.testing.allocator;
+    const without = try allTools(a, ".", .{});
+    defer deinitTools(a, without);
+    for (without) |t| try std.testing.expect(!std.mem.eql(u8, t.name(), "discord_manage"));
+    const with = try allTools(a, ".", .{ .discord_manage_binding = .{ .token = "test-key", .guild_id = "123", .operator_discord_id = "456" } });
+    defer deinitTools(a, with);
+    var found = false;
+    for (with) |t| if (std.mem.eql(u8, t.name(), "discord_manage")) {
+        found = true;
+    };
+    try std.testing.expect(found);
+    // Regression: customizations must still disable the registered tool.
+    const disabled = try allTools(a, ".", .{
+        .discord_manage_binding = .{ .token = "test-key", .guild_id = "123", .operator_discord_id = "456" },
+        .tools_config = .{ .tool_customizations = &.{.{ .name = "discord_manage", .enabled = false }} },
+    });
+    defer deinitTools(a, disabled);
+    for (disabled) |t| try std.testing.expect(!std.mem.eql(u8, t.name(), "discord_manage"));
+    const restricted = try subagentTools(a, ".", .{});
+    defer deinitTools(a, restricted);
+    for (restricted) |t| try std.testing.expect(!std.mem.eql(u8, t.name(), "discord_manage"));
 }

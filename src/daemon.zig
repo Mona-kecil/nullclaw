@@ -762,6 +762,7 @@ fn buildInboundConversationContext(
         .sender_id = if (msg.sender_id.len > 0) msg.sender_id else null,
         .sender_username = meta.sender_username,
         .sender_display_name = meta.sender_display_name,
+        .trusted_sender = msg.trusted_sender,
         .delivery_chat_id = if (msg.chat_id.len > 0) msg.chat_id else null,
         .peer_id = meta.peer_id orelse if (derived_peer) |peer| peer.id else if (has_scope) msg.chat_id else null,
         .group_id = group_id,
@@ -2837,6 +2838,7 @@ test "buildInboundConversationContext preserves discord identity metadata" {
         .chat_id = "778899",
         .content = "hello",
         .session_key = "discord:778899",
+        .trusted_sender = true,
     };
     const context = buildInboundConversationContext(&msg, .{
         .account_id = "discord-main",
@@ -2849,6 +2851,7 @@ test "buildInboundConversationContext preserves discord identity metadata" {
     try std.testing.expectEqualStrings("discord", context.channel.?);
     try std.testing.expectEqualStrings("discord-main", context.account_id.?);
     try std.testing.expectEqualStrings("user-42", context.sender_id.?);
+    try std.testing.expect(context.trusted_sender);
     try std.testing.expectEqualStrings("778899", context.delivery_chat_id.?);
     try std.testing.expectEqualStrings("778899", context.peer_id.?);
     try std.testing.expectEqualStrings("discord-user", context.sender_username.?);
@@ -3629,4 +3632,11 @@ test "markError records AddressInUse for gateway component" {
     try std.testing.expect(!state.components[0].?.running);
     try std.testing.expectEqual(@as(u64, 1), state.components[0].?.restart_count);
     try std.testing.expectEqualStrings("AddressInUse", state.components[0].?.last_error.?);
+}
+
+test "inbound discord identity is untrusted without bus verification" {
+    // Regression: a webhook can forge both the Discord channel and sender ID.
+    const msg = bus_mod.InboundMessage{ .channel = "discord", .sender_id = "456", .chat_id = "123", .content = "", .session_key = "discord:123" };
+    const context = buildInboundConversationContext(&msg, .{}) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!context.trusted_sender);
 }

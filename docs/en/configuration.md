@@ -448,6 +448,26 @@ Notes:
 - Failover order for bare model refs: primary provider first, then each listed `fallback_provider`.
 - Provider-qualified fallback refs such as `openai/gpt-4o` route directly to that provider and skip the generic provider fanout.
 - `api_keys`: (Optional) List of extra API keys for rotation on rate-limit (429) errors.
+### `operator_identity`
+
+Configure the operator's name and platform identities separately from channel
+allowlists. When an incoming Discord ID or Telegram username matches, the agent's
+conversation context identifies that sender as the operator. Other allowed senders
+do not receive that designation.
+
+```json
+"operator_identity": {
+  "name": "User A",
+  "discord_id": "123456789",
+  "telegram_username": "user_a"
+}
+```
+
+Omit an identifier to disable operator matching for that platform. Telegram
+usernames can change or be reassigned. This designation informs the model; it
+does not grant tool permissions or replace approval mechanisms. Group replies
+remain visible to the group.
+
 ### `identity` (AIEOS v1.1)
 
 Use this section when you want the runtime identity to come from an AIEOS document.
@@ -1000,7 +1020,7 @@ Parameters:
 - `allow_bots` (default: false) - Allow messages from other bots. Messages posted by the bot itself are always ignored, even when this is enabled
 - `allow_from` (default: []) - User ID allowlist. An omitted or empty list denies inbound messages. `["*"]` explicitly allows all users
 - `require_mention` (default: false) - Require bot mention in guilds to respond
-- `guild_id` (optional) - Reserved for Discord server scoping; current runtime does not enforce it
+- `guild_id` (optional) - Limits native slash commands to this server. With `operator_identity.discord_id`, enables `discord_manage` for verified messages from that operator; the bot needs the Manage Channels permission. Configure exactly one Discord account with a guild ID. Native Discord slash commands cannot use `discord_manage` because they do not carry `trusted_sender`.
 
 NullClaw splits messages >2000 characters (Discord API limit).
 

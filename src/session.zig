@@ -1287,6 +1287,7 @@ pub const SessionManager = struct {
         onboard.scaffoldWorkspace(self.allocator, workspace_dir, &project_ctx, bootstrap_provider) catch {};
 
         const runtime_tools = tools_mod.allTools(self.allocator, workspace_dir, .{
+            .discord_manage_binding = tools_mod.discord_manage.bindingFromConfig(self.config),
             .http_enabled = self.config.http_request.enabled,
             .http_allowed_domains = self.config.http_request.allowed_domains,
             .http_max_response_size = self.config.http_request.max_response_size,
@@ -1904,6 +1905,8 @@ pub const SessionManager = struct {
             const late_content = (try session.drainInjection(self.allocator, self.allocator)) orelse break;
             defer self.allocator.free(late_content);
 
+            // Late injected text has no verified sender provenance.
+            if (session.agent.conversation_context) |*context| context.trusted_sender = false;
             const previous_response = response;
             response = session.agent.turn(late_content) catch |err| {
                 self.allocator.free(previous_response);
@@ -2688,6 +2691,95 @@ const ProbeTool = struct {
     pub fn execute(_: *@This(), allocator: Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
         return .{ .success = true, .output = try allocator.dupe(u8, "probe ok") };
     }
+};
+
+const TrustProbeTool = struct {
+    pub const tool_name = "trust_probe";
+    pub const tool_description = "Capture trusted sender";
+    pub const tool_params = "{}";
+    const vtable = tools_mod.ToolVTable(@This());
+    observations: [3]?tools_mod.TrustedSender = .{ null, null, null },
+    count: usize = 0,
+
+    fn tool(self: *@This()) Tool {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    pub fn execute(self: *@This(), allocator: Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+        self.observations[self.count] = tools_mod.threadTrustedSender();
+        self.count += 1;
+        return .{ .success = true, .output = try allocator.dupe(u8, "ok") };
+    }
+};
+
+const LateTrustProvider = struct {
+    calls: usize = 0,
+    const vtable = Provider.VTable{
+        .chatWithSystem = chatWithSystem,
+        .chat = chat,
+        .supportsNativeTools = supportsNativeTools,
+        .getName = getName,
+        .deinit = deinitFn,
+    };
+
+    fn provider(self: *@This()) Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+    fn chatWithSystem(_: *anyopaque, allocator: Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+        return allocator.dupe(u8, "ok");
+    }
+    fn chat(ptr: *anyopaque, allocator: Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        if (self.calls == 1 or self.calls == 3 or self.calls == 5) {
+            const calls = try allocator.alloc(providers.ToolCall, 1);
+            calls[0] = .{
+                .id = try allocator.dupe(u8, "call-probe"),
+                .name = try allocator.dupe(u8, "trust_probe"),
+                .arguments = try allocator.dupe(u8, "{}"),
+            };
+            return .{ .content = try allocator.dupe(u8, "running"), .tool_calls = calls };
+        }
+        return .{ .content = try allocator.dupe(u8, "done") };
+    }
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return true;
+    }
+    fn getName(_: *anyopaque) []const u8 {
+        return "late_trust";
+    }
+    fn deinitFn(_: *anyopaque) void {}
+};
+
+const LateInjectionObserver = struct {
+    session_mgr: *SessionManager,
+    session_key: []const u8,
+    route_action: ?SessionManager.InboundRouteAction = null,
+    const vtable = Observer.VTable{
+        .record_event = recordEvent,
+        .record_metric = recordMetric,
+        .flush = flush,
+        .name = name,
+        .get_trace_id = getTraceId,
+        .set_trace_id = setTraceId,
+    };
+    fn observer(self: *@This()) Observer {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    fn recordEvent(ptr: *anyopaque, event: *const observability.ObserverEvent) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (event.* == .turn_complete and self.route_action == null)
+            self.route_action = self.session_mgr.routeInbound(self.session_key, "late message");
+    }
+    fn recordMetric(_: *anyopaque, _: *const observability.ObserverMetric) void {}
+    fn flush(_: *anyopaque) void {}
+    fn name(_: *anyopaque) []const u8 {
+        return "late_injection";
+    }
+    fn getTraceId(_: *anyopaque) ?[32]u8 {
+        return null;
+    }
+    fn setTraceId(_: *anyopaque, _: [32]u8) void {}
 };
 
 const SummaryFailureProvider = struct {
@@ -4520,6 +4612,34 @@ test "processMessageStreaming drains late injection before completing turn" {
     try testing.expectEqualStrings("late message", provider.userMessage(1));
     try testing.expect(!session.hasInjection());
     try testing.expectEqual(@as(u64, 1), session.turn_count);
+}
+
+test "late injected turn revokes trust and next request restores it" {
+    // Regression: the session late-drain bypass retained the original trusted sender.
+    for ([_]agent_mod.Agent.QueueMode{ .latest, .debounce }) |mode| {
+        const cfg = testConfig();
+        const session_key = "agent:main:main";
+        var provider = LateTrustProvider{};
+        var observer = LateInjectionObserver{ .session_mgr = undefined, .session_key = session_key };
+        var probe = TrustProbeTool{};
+        const tools = [_]Tool{probe.tool()};
+        var sm = SessionManager.init(testing.allocator, &cfg, provider.provider(), &tools, null, observer.observer(), null, null);
+        defer sm.deinit();
+        observer.session_mgr = &sm;
+        const session = try sm.getOrCreate(session_key);
+        session.agent.queue_mode = mode;
+        const context: ConversationContext = .{ .channel = "discord", .sender_id = "123", .trusted_sender = true };
+        const first = try sm.processMessage(session_key, "initial", context);
+        defer testing.allocator.free(first);
+        try testing.expectEqual(SessionManager.InboundRouteAction.skip, observer.route_action.?);
+        try testing.expectEqual(@as(usize, 2), probe.count);
+        try testing.expectEqualStrings("123", probe.observations[0].?.sender_id);
+        try testing.expect(probe.observations[1] == null);
+        const next = try sm.processMessage(session_key, "next", context);
+        defer testing.allocator.free(next);
+        try testing.expectEqual(@as(usize, 3), probe.count);
+        try testing.expectEqualStrings("123", probe.observations[2].?.sender_id);
+    }
 }
 
 test "processMessage refreshes system prompt when conversation context is cleared" {

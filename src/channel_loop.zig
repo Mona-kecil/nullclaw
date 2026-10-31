@@ -728,10 +728,13 @@ fn telegramConversationContext(
     account_id: []const u8,
     sender: []const u8,
     is_group: bool,
+    sender_identity: []const u8,
 ) ?ConversationContext {
     return buildConversationContext(.{
         .channel = "telegram",
         .account_id = account_id,
+        .sender_id = sender_identity,
+        .trusted_sender = true,
         .delivery_chat_id = sender,
         .peer_id = sender,
         .is_group = is_group,
@@ -759,7 +762,7 @@ fn handleTelegramInteractiveCallback(
         if (draft_turn_id != 0) tg_ptr.finishDraftTurn(typing_target, draft_turn_id) catch {};
     }
 
-    const conversation_context = telegramConversationContext(tg_ptr.account_id, sender, is_group);
+    const conversation_context = telegramConversationContext(tg_ptr.account_id, sender, is_group, message_sender_id);
 
     var response_owned = false;
     const response = blk: {
@@ -974,7 +977,7 @@ fn processTelegramMessage(
     defer setScheduleToolContext(runtime.tools, null, null, null, null, null, null);
 
     // Build conversation context for Telegram
-    const conversation_context = telegramConversationContext(tg_ptr.account_id, sender, is_group);
+    const conversation_context = telegramConversationContext(tg_ptr.account_id, sender, is_group, message_sender_id);
 
     var stream_ctx = telegram.TelegramChannel.StreamCtx{
         .tg_ptr = tg_ptr,
@@ -1339,6 +1342,7 @@ pub const ChannelRuntime = struct {
 
         // Tools
         const tools = tools_mod.allTools(allocator, config.workspace_dir, .{
+            .discord_manage_binding = tools_mod.discord_manage.bindingFromConfig(config),
             .http_enabled = config.http_request.enabled,
             .http_allowed_domains = config.http_request.allowed_domains,
             .http_max_response_size = config.http_request.max_response_size,
@@ -3032,12 +3036,15 @@ test "buildTelegramBindingStatusReply distinguishes exact and inherited peer bin
 }
 
 test "telegramConversationContext keeps delivery target for callback-driven topic sessions" {
-    const context = telegramConversationContext("main", "-100123#topic:77", true) orelse return error.TestUnexpectedResult;
+    const context = telegramConversationContext("main", "-100123#topic:77", true, "user_a") orelse return error.TestUnexpectedResult;
 
     // Regression: Telegram button callbacks must keep the outbound delivery target,
     // or scheduled/tool-driven follow-ups can route to the session peer only.
     try std.testing.expectEqualStrings("telegram", context.channel.?);
     try std.testing.expectEqualStrings("main", context.account_id.?);
+    // Regression: Telegram sender identity was omitted from the agent context.
+    try std.testing.expectEqualStrings("user_a", context.sender_id.?);
+    try std.testing.expect(context.trusted_sender);
     try std.testing.expectEqualStrings("-100123#topic:77", context.delivery_chat_id.?);
     try std.testing.expectEqualStrings("-100123#topic:77", context.peer_id.?);
     try std.testing.expectEqualStrings("-100123#topic:77", context.group_id.?);
