@@ -1,7 +1,8 @@
 # Mono fork
 
 This fork keeps the changes used by Mono. The `mono` branch starts at upstream
-`v2026.5.29`, commit `b25c6eb59f845f4f8cdbb50d6f284cb56d723435`.
+`v2026.5.29`, commit `b25c6eb59f845f4f8cdbb50d6f284cb56d723435`, and last merged
+upstream `main` at commit `5f1cade05c19b6ecdfb9565ae3305e892e484da9`.
 
 - `origin` is `https://github.com/Mona-kecil/nullclaw.git`.
 - `upstream` is `https://github.com/nullclaw/nullclaw.git`.
@@ -15,6 +16,7 @@ This fork keeps the changes used by Mono. The `mono` branch starts at upstream
 - Enforce Telegram POST deadlines so stalled polls can retry after wake.
 - Allow public research from social channels before approval for protected actions.
 - Acknowledge session resets without a model call and queue follow-up messages by default.
+  `agent.default_queue_mode` defaults to `serial` here, not upstream's `off`.
 
 See [Discord command setup](docs/en/discord-native-commands.md).
 
@@ -32,7 +34,7 @@ bun scripts/register_discord_commands.mjs --self-test
 zig build -Doptimize=ReleaseSmall -Dversion=2026.5.29-mono
 ```
 
-The imported source passed 7,330 tests with nine skipped and a ReleaseSmall
+The last upstream merge passed 7,509 tests with nine skipped and a ReleaseSmall
 build on macOS arm64. The Discord catalog was verified against the live server.
 
 Keep configuration, credentials, chat databases, and build caches outside Git.
