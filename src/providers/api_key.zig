@@ -3,6 +3,7 @@ const std_compat = @import("compat");
 const builtin = @import("builtin");
 const auth = @import("../auth.zig");
 const config_mod = @import("../config_types.zig");
+const fs_compat = @import("../fs_compat.zig");
 const json_util = @import("../json_util.zig");
 const platform = @import("../platform.zig");
 const provider_names = @import("../provider_names.zig");
@@ -217,9 +218,7 @@ fn writeQwenCredentialsJson(
 
     try buf.append(allocator, '}');
 
-    const file = std_compat.fs.createFileAbsolute(path, .{ .permissions = std_compat.fs.permissionsFromMode(0o600) }) catch return error.FileWriteError;
-    defer file.close();
-    try file.writeAll(buf.items);
+    fs_compat.writeFileAtomicSecure(path, buf.items) catch return error.FileWriteError;
 }
 
 fn refreshQwenCliCredentials(
@@ -324,6 +323,8 @@ fn providerEnvCandidates(name: []const u8) [3][]const u8 {
         .{ "venice", .{ "VENICE_API_KEY", "", "" } },
         .{ "nearai", .{ "NEARAI_API_KEY", "NEARAI_CLOUD_API_KEY", "NEAR_AI_API_KEY" } },
         .{ "atlas-cloud", .{ "ATLASCLOUD_API_KEY", "ATLAS_CLOUD_API_KEY", "ATLAS_API_KEY" } },
+        .{ "evolink", .{ "EVOLINK_API_KEY", "", "" } },
+        .{ "edenai", .{ "EDENAI_API_KEY", "", "" } },
         .{ "poe", .{ "POE_API_KEY", "", "" } },
         .{ "moonshot", .{ "MOONSHOT_API_KEY", "", "" } },
         .{ "kimi", .{ "MOONSHOT_API_KEY", "", "" } },
@@ -422,6 +423,17 @@ test "atlas cloud env candidates include documented ATLASCLOUD_API_KEY" {
     try std.testing.expectEqualStrings("ATLASCLOUD_API_KEY", providerEnvCandidates("atlascloud")[0]);
 }
 
+test "evolink env candidate is EVOLINK_API_KEY" {
+    const candidates = providerEnvCandidates("evolink");
+    try std.testing.expectEqualStrings("EVOLINK_API_KEY", candidates[0]);
+}
+
+test "edenai env candidate is EDENAI_API_KEY across aliases" {
+    try std.testing.expectEqualStrings("EDENAI_API_KEY", providerEnvCandidates("edenai")[0]);
+    try std.testing.expectEqualStrings("EDENAI_API_KEY", providerEnvCandidates("eden-ai")[0]);
+    try std.testing.expectEqualStrings("EDENAI_API_KEY", providerEnvCandidates("eden_ai")[0]);
+}
+
 test "azure aliases share Azure env candidate" {
     try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvCandidates("azure")[0]);
     try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvCandidates("azure-openai")[0]);
@@ -483,17 +495,9 @@ test "resolveApiKeyFromConfig falls through to env for missing provider" {
 }
 
 test "resolveApiKeyFromConfig falls through to env when provider entry omits api key" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    const c = @cImport({
-        @cInclude("stdlib.h");
-    });
-
-    const api_key_z = try std.testing.allocator.dupeZ(u8, "OPENROUTER_API_KEY");
-    defer std.testing.allocator.free(api_key_z);
-    const api_value_z = try std.testing.allocator.dupeZ(u8, "env-openrouter-key");
-    defer std.testing.allocator.free(api_value_z);
-    try std.testing.expectEqual(@as(c_int, 0), c.setenv(api_key_z.ptr, api_value_z.ptr, 1));
-    defer _ = c.unsetenv(api_key_z.ptr);
+    var env_guard = try platform.TestEnvGuard.capture(std.testing.allocator, &.{"OPENROUTER_API_KEY"});
+    defer env_guard.deinit();
+    try platform.setProcessEnv(std.testing.allocator, "OPENROUTER_API_KEY", "env-openrouter-key");
 
     const entries = [_]config_mod.ProviderEntry{
         .{ .name = "openrouter" },
@@ -612,27 +616,20 @@ test "writeQwenCredentialsJson preserves qwen oauth fields" {
     try std.testing.expectEqualStrings("id-token", obj.get("id_token").?.string);
     try std.testing.expectEqualStrings("https://portal.qwen.ai/v1", obj.get("resource_url").?.string);
     try std.testing.expectEqual(@as(i64, 1735689600000), obj.get("expiry_date").?.integer);
+    if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        const metadata = try file.stat();
+        try std.testing.expectEqual(@as(std_compat.fs.File.Mode, 0o600), metadata.mode & 0o777);
+    }
 }
 
 test "resolveApiKey qwen-portal prefers oauth env over dashscope key" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    const c = @cImport({
-        @cInclude("stdlib.h");
-    });
-
-    const oauth_key_z = try std.testing.allocator.dupeZ(u8, "QWEN_OAUTH_TOKEN");
-    defer std.testing.allocator.free(oauth_key_z);
-    const oauth_value_z = try std.testing.allocator.dupeZ(u8, "oauth-token");
-    defer std.testing.allocator.free(oauth_value_z);
-    try std.testing.expectEqual(@as(c_int, 0), c.setenv(oauth_key_z.ptr, oauth_value_z.ptr, 1));
-    defer _ = c.unsetenv(oauth_key_z.ptr);
-
-    const api_key_z = try std.testing.allocator.dupeZ(u8, "DASHSCOPE_API_KEY");
-    defer std.testing.allocator.free(api_key_z);
-    const api_value_z = try std.testing.allocator.dupeZ(u8, "dashscope-key");
-    defer std.testing.allocator.free(api_value_z);
-    try std.testing.expectEqual(@as(c_int, 0), c.setenv(api_key_z.ptr, api_value_z.ptr, 1));
-    defer _ = c.unsetenv(api_key_z.ptr);
+    var env_guard = try platform.TestEnvGuard.capture(
+        std.testing.allocator,
+        &.{ "QWEN_OAUTH_TOKEN", "DASHSCOPE_API_KEY" },
+    );
+    defer env_guard.deinit();
+    try platform.setProcessEnv(std.testing.allocator, "QWEN_OAUTH_TOKEN", "oauth-token");
+    try platform.setProcessEnv(std.testing.allocator, "DASHSCOPE_API_KEY", "dashscope-key");
 
     const result = try resolveApiKey(std.testing.allocator, "qwen-portal", null);
     defer if (result) |value| std.testing.allocator.free(value);

@@ -257,7 +257,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn printVersion() void {
     var buf: [256]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&buf);
+    var bw = std_compat.fs.File.stdout().writerStreaming(&buf);
     bw.interface.print("nullclaw {s}\n", .{yc.version.string}) catch return;
     bw.interface.flush() catch return;
 }
@@ -951,27 +951,36 @@ fn parseCronSessionTargetArg(raw: []const u8) !yc.cron.SessionTarget {
     return yc.cron.SessionTarget.parseStrict(raw);
 }
 
+fn cronAgentOptionValue(sub_args: []const []const u8, option_index: usize) ![]const u8 {
+    if (option_index + 1 >= sub_args.len or std.mem.startsWith(u8, sub_args[option_index + 1], "--")) {
+        return error.MissingCronOptionValue;
+    }
+    return sub_args[option_index + 1];
+}
+
 fn parseCronAgentOptions(sub_args: []const []const u8, start_index: usize) !CronAddAgentOptions {
     var options = CronAddAgentOptions{};
     var i: usize = start_index;
     while (i < sub_args.len) : (i += 1) {
-        if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--model")) {
-            options.model = sub_args[i + 1];
+        if (std.mem.eql(u8, sub_args[i], "--model")) {
+            options.model = try cronAgentOptionValue(sub_args, i);
             i += 1;
-        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--session-target")) {
-            options.session_target = try parseCronSessionTargetArg(sub_args[i + 1]);
+        } else if (std.mem.eql(u8, sub_args[i], "--session-target")) {
+            options.session_target = try parseCronSessionTargetArg(try cronAgentOptionValue(sub_args, i));
             i += 1;
         } else if (std.mem.eql(u8, sub_args[i], "--announce")) {
             options.delivery.mode = .always;
-        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--channel")) {
-            options.delivery.channel = sub_args[i + 1];
+        } else if (std.mem.eql(u8, sub_args[i], "--channel")) {
+            options.delivery.channel = try cronAgentOptionValue(sub_args, i);
             i += 1;
-        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--account")) {
-            options.delivery.account_id = sub_args[i + 1];
+        } else if (std.mem.eql(u8, sub_args[i], "--account")) {
+            options.delivery.account_id = try cronAgentOptionValue(sub_args, i);
             i += 1;
-        } else if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--to")) {
-            options.delivery.to = sub_args[i + 1];
+        } else if (std.mem.eql(u8, sub_args[i], "--to")) {
+            options.delivery.to = try cronAgentOptionValue(sub_args, i);
             i += 1;
+        } else {
+            return error.UnknownCronOption;
         }
     }
     return options;
@@ -991,10 +1000,10 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\  get <id> [--json]             Show one scheduled task
             \\  status [--json]               Show scheduler daemon status
             \\  add <expression> <command>    Add a recurring cron job
-            \\  add-agent <expression> <prompt> [--model <model>] [--announce] [--channel <name>] [--account <id>] [--to <id>]
+            \\  add-agent <expression> <prompt> [--model <model>] [--session-target <isolated|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>]
             \\                                Add a recurring agent cron job
             \\  once <delay> <command>        Add a one-shot delayed task
-            \\  once-agent <delay> <prompt> [--model <model>]
+            \\  once-agent <delay> <prompt> [--model <model>] [--session-target <isolated|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>]
             \\                                Add a one-shot delayed agent task
             \\  remove <id>                   Remove a scheduled task
             \\  pause <id>                    Pause a scheduled task
@@ -1067,6 +1076,14 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                 std.debug.print("Invalid --session-target: expected 'isolated' or 'main'\n", .{});
                 std_compat.process.exit(1);
             },
+            error.MissingCronOptionValue => {
+                std.debug.print("Missing value for cron agent option\n", .{});
+                std_compat.process.exit(1);
+            },
+            error.UnknownCronOption => {
+                std.debug.print("Unknown cron agent option\n", .{});
+                std_compat.process.exit(1);
+            },
         };
         try yc.cron.cliAddAgentJob(allocator, sub_args[1], sub_args[2], options.model, options.session_target, options.delivery);
     } else if (std.mem.eql(u8, subcmd, "once")) {
@@ -1077,7 +1094,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         try yc.cron.cliAddOnce(allocator, sub_args[1], sub_args[2]);
     } else if (std.mem.eql(u8, subcmd, "once-agent")) {
         if (sub_args.len < 3) {
-            std.debug.print("Usage: nullclaw cron once-agent <delay> <prompt> [--model <model>] [--session-target <isolated|main>]\n", .{});
+            std.debug.print("Usage: nullclaw cron once-agent <delay> <prompt> [--model <model>] [--session-target <isolated|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>]\n", .{});
             std_compat.process.exit(1);
         }
         const options = parseCronAgentOptions(sub_args, 3) catch |err| switch (err) {
@@ -1085,8 +1102,16 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                 std.debug.print("Invalid --session-target: expected 'isolated' or 'main'\n", .{});
                 std_compat.process.exit(1);
             },
+            error.MissingCronOptionValue => {
+                std.debug.print("Missing value for cron agent option\n", .{});
+                std_compat.process.exit(1);
+            },
+            error.UnknownCronOption => {
+                std.debug.print("Unknown cron agent option\n", .{});
+                std_compat.process.exit(1);
+            },
         };
-        try yc.cron.cliAddAgentOnce(allocator, sub_args[1], sub_args[2], options.model, options.session_target);
+        try yc.cron.cliAddAgentOnce(allocator, sub_args[1], sub_args[2], options.model, options.session_target, options.delivery);
     } else if (std.mem.eql(u8, subcmd, "remove")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw cron remove <id>\n", .{});
@@ -2366,7 +2391,7 @@ fn writeMemoryExportJsonlStdout(
     options: MemoryExportOptions,
 ) !void {
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writerStreaming(&stdout_buf);
     try writeMemoryExportJsonlStream(allocator, &bw.interface, mem, options);
     try bw.interface.flush();
 }
@@ -5369,7 +5394,7 @@ fn runAuth(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         std.debug.print("Unknown auth provider: {s}\n\n", .{provider_name});
         std.debug.print("Available providers:\n", .{});
         std.debug.print("  openai-codex    ChatGPT Plus/Pro subscription (OAuth)\n", .{});
-        std.debug.print("  weixin          WeChat personal account (QR code scan)\n", .{});
+        std.debug.print("  weixin          WeChat iLink Bot (QR code scan)\n", .{});
         std_compat.process.exit(1);
     }
 
@@ -5464,12 +5489,17 @@ fn printAuthUsage() void {
         \\
         \\Providers:
         \\  openai-codex    ChatGPT Plus/Pro subscription (OAuth)
-        \\  weixin          WeChat personal account (QR code scan)
+        \\  weixin          WeChat iLink Bot (QR code scan)
         \\
         \\Weixin options:
         \\  --base-url <url>    iLink API base URL (default: https://ilinkai.weixin.qq.com/)
         \\  --proxy <url>       HTTP proxy URL (e.g. http://localhost:7890)
         \\  --timeout <secs>    Login timeout in seconds (default: 300)
+        \\
+        \\Weixin account selection:
+        \\  These commands take no account selector. With multiple accounts
+        \\  configured, the account is picked in this order: `default`, then
+        \\  `main`, then the lexicographically first account id.
         \\
         \\Examples:
         \\  nullclaw auth login openai-codex
@@ -5479,13 +5509,236 @@ fn printAuthUsage() void {
         \\  nullclaw auth status openai-codex
         \\  nullclaw auth status weixin
         \\  nullclaw auth logout openai-codex
+        \\  nullclaw auth logout weixin
         \\
     , .{AUTH_SUBCOMMANDS}), .{});
 }
 
+const DEFAULT_WEIXIN_BASE_URL = yc.config.config_types.WeixinConfig.DEFAULT_BASE_URL;
+
+fn parseWeixinTimeoutNs(raw: []const u8) !u64 {
+    const seconds = try std.fmt.parseInt(u64, raw, 10);
+    if (seconds == 0) return error.InvalidTimeout;
+    return std.math.mul(u64, seconds, @as(u64, std.time.ns_per_s));
+}
+
+const WeixinCredentialMutation = union(enum) {
+    login: struct {
+        token: []const u8,
+        base_url: []const u8,
+        proxy: ?[]const u8,
+    },
+    logout,
+};
+
+const SelectedWeixinConfig = struct {
+    channel: *std.json.ObjectMap,
+    account: *std.json.ObjectMap,
+    wrapped: bool,
+};
+
+fn clearWeixinCredentialFields(object: *std.json.ObjectMap) void {
+    _ = object.swapRemove("token");
+    _ = object.swapRemove("base_url");
+    _ = object.swapRemove("proxy");
+}
+
+fn isValidWeixinAccountJson(object: std.json.ObjectMap) bool {
+    inline for (.{ "account_id", "token", "base_url" }) |field| {
+        if (object.get(field)) |value| {
+            if (value != .string) return false;
+        }
+    }
+    if (object.get("proxy")) |proxy| {
+        if (proxy != .null and proxy != .string) return false;
+    }
+    if (object.get("allow_from")) |allow_from| {
+        if (allow_from != .array) return false;
+        for (allow_from.array.items) |entry| {
+            // Match config parsing, which also accepts integer IDs and coerces them to strings.
+            if (entry != .string and entry != .integer) return false;
+        }
+    }
+    return true;
+}
+
+fn putJsonString(
+    allocator: std.mem.Allocator,
+    object: *std.json.ObjectMap,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    const owned_value = try allocator.dupe(u8, value);
+    if (object.getPtr(key)) |slot| {
+        slot.* = .{ .string = owned_value };
+        return;
+    }
+    try object.put(allocator, try allocator.dupe(u8, key), .{ .string = owned_value });
+}
+
+fn migrateLegacyWeixinAccounts(allocator: std.mem.Allocator, channel: *std.json.Value) !void {
+    if (channel.* != .array) return;
+
+    var accounts: std.json.ObjectMap = .empty;
+    for (channel.array.items, 0..) |item, index| {
+        if (item != .object) return error.InvalidWeixinConfig;
+
+        var account = item;
+        const configured_id = if (account.object.get("account_id")) |account_id|
+            if (account_id == .string and account_id.string.len > 0) account_id.string else null
+        else
+            null;
+
+        var account_id = configured_id orelse if (index == 0)
+            "default"
+        else
+            try std.fmt.allocPrint(allocator, "account-{d}", .{index + 1});
+        var suffix = index + 1;
+        while (accounts.get(account_id) != null) : (suffix += 1) {
+            account_id = try std.fmt.allocPrint(allocator, "account-{d}", .{suffix});
+        }
+
+        _ = account.object.swapRemove("account_id");
+        try accounts.put(allocator, try allocator.dupe(u8, account_id), account);
+    }
+
+    channel.* = .{ .object = .empty };
+    if (accounts.count() > 0) {
+        try channel.object.put(allocator, try allocator.dupe(u8, "accounts"), .{ .object = accounts });
+    }
+}
+
+fn selectWeixinConfig(
+    allocator: std.mem.Allocator,
+    channel: *std.json.Value,
+) !SelectedWeixinConfig {
+    try migrateLegacyWeixinAccounts(allocator, channel);
+    if (channel.* != .object) return error.InvalidWeixinConfig;
+
+    const channel_object = &channel.object;
+    const accounts_value = channel_object.getPtr("accounts") orelse return .{
+        .channel = channel_object,
+        .account = channel_object,
+        .wrapped = false,
+    };
+    if (accounts_value.* != .object) return error.InvalidWeixinConfig;
+
+    const accounts = &accounts_value.object;
+    var object_count: usize = 0;
+    var count_it = accounts.iterator();
+    while (count_it.next()) |entry| {
+        if (entry.value_ptr.* == .object) object_count += 1;
+    }
+    if (object_count == 0) {
+        // Match config parsing: an empty (or entirely malformed) accounts map
+        // falls back to the inline channel object.
+        return .{ .channel = channel_object, .account = channel_object, .wrapped = false };
+    }
+
+    if (accounts.getPtr("default")) |account| {
+        if (account.* == .object) return .{ .channel = channel_object, .account = &account.object, .wrapped = true };
+    }
+    if (accounts.getPtr("main")) |account| {
+        if (account.* == .object) return .{ .channel = channel_object, .account = &account.object, .wrapped = true };
+    }
+
+    var selected_key: ?[]const u8 = null;
+    var selected_value: ?*std.json.Value = null;
+    var it = accounts.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .object) continue;
+        if (selected_key == null or std.mem.order(u8, entry.key_ptr.*, selected_key.?) == .lt) {
+            selected_key = entry.key_ptr.*;
+            selected_value = entry.value_ptr;
+        }
+    }
+    const account = selected_value orelse unreachable;
+    return .{ .channel = channel_object, .account = &account.object, .wrapped = true };
+}
+
+fn updateWeixinChannelJson(
+    allocator: std.mem.Allocator,
+    current_json: ?[]const u8,
+    mutation: WeixinCredentialMutation,
+) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        arena_allocator,
+        current_json orelse "{}",
+        .{},
+    );
+    var channel = parsed.value;
+    const selected = try selectWeixinConfig(arena_allocator, &channel);
+
+    switch (mutation) {
+        .login => |credentials| {
+            try putJsonString(arena_allocator, selected.account, "token", credentials.token);
+            if (std.mem.eql(u8, credentials.base_url, DEFAULT_WEIXIN_BASE_URL)) {
+                _ = selected.account.swapRemove("base_url");
+            } else {
+                try putJsonString(arena_allocator, selected.account, "base_url", credentials.base_url);
+            }
+            if (credentials.proxy) |proxy| {
+                try putJsonString(arena_allocator, selected.account, "proxy", proxy);
+            }
+            if (selected.account.get("allow_from") == null) {
+                try selected.account.put(
+                    arena_allocator,
+                    try arena_allocator.dupe(u8, "allow_from"),
+                    .{ .array = std.json.Array.init(arena_allocator) },
+                );
+            }
+            if (!isValidWeixinAccountJson(selected.account.*)) return error.InvalidWeixinConfig;
+        },
+        .logout => {
+            _ = selected.account.swapRemove("token");
+        },
+    }
+
+    if (selected.wrapped) {
+        // Older login commands wrote ignored credentials beside `accounts`.
+        clearWeixinCredentialFields(selected.channel);
+    }
+
+    return std.json.Stringify.valueAlloc(allocator, channel, .{ .whitespace = .indent_2 });
+}
+
+fn mutateStoredWeixinCredentials(
+    allocator: std.mem.Allocator,
+    mutation: WeixinCredentialMutation,
+) !bool {
+    const config_mutator = yc.config_mutator;
+    const current_json = config_mutator.findPathValueJson(allocator, "channels.weixin") catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (current_json) |json| allocator.free(json);
+
+    switch (mutation) {
+        .logout => if (current_json == null) return false,
+        .login => {},
+    }
+
+    const updated_json = try updateWeixinChannelJson(allocator, current_json, mutation);
+    defer allocator.free(updated_json);
+
+    var result = try config_mutator.mutateDefaultConfig(
+        allocator,
+        .set,
+        "channels.weixin",
+        updated_json,
+        .{ .apply = true },
+    );
+    defer config_mutator.freeMutationResult(allocator, &result);
+    return result.changed;
+}
+
 fn runAuthWeixin(allocator: std.mem.Allocator, subcmd: []const u8, args: []const []const u8) void {
     const weixin_mod = yc.channels.weixin;
-    const config_mutator = yc.config_mutator;
 
     if (std.mem.eql(u8, subcmd, "login")) {
         var opts = weixin_mod.LoginOptions{};
@@ -5500,11 +5753,10 @@ fn runAuthWeixin(allocator: std.mem.Allocator, subcmd: []const u8, args: []const
                 opts.proxy = args[i];
             } else if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
                 i += 1;
-                const secs = std.fmt.parseInt(u64, args[i], 10) catch {
+                opts.timeout_ns = parseWeixinTimeoutNs(args[i]) catch {
                     std.debug.print("Invalid timeout value: {s}\n", .{args[i]});
                     std.process.exit(1);
                 };
-                opts.timeout_ns = secs * std.time.ns_per_s;
             } else {
                 std.debug.print("Unknown option: {s}\n", .{args[i]});
                 printAuthUsage();
@@ -5512,7 +5764,18 @@ fn runAuthWeixin(allocator: std.mem.Allocator, subcmd: []const u8, args: []const
             }
         }
 
-        std.debug.print("Starting Weixin (WeChat personal) login...\n\n", .{});
+        if (!weixin_mod.isValidBaseUrl(opts.base_url)) {
+            std.debug.print("Invalid Weixin base URL: expected an HTTPS URL without a query or fragment.\n", .{});
+            std.process.exit(1);
+        }
+        if (opts.proxy) |proxy| {
+            if (!yc.config.HttpRequestConfig.isValidProxyUrl(proxy)) {
+                std.debug.print("Invalid Weixin proxy URL.\n", .{});
+                std.process.exit(1);
+            }
+        }
+
+        std.debug.print("Starting Weixin iLink Bot login...\n\n", .{});
 
         var result = weixin_mod.performLogin(allocator, opts) catch |err| {
             std.debug.print("Weixin login failed: {s}\n", .{@errorName(err)});
@@ -5526,43 +5789,21 @@ fn runAuthWeixin(allocator: std.mem.Allocator, subcmd: []const u8, args: []const
             std.debug.print("  User ID: {s}\n", .{result.user_id});
         }
 
-        // Persist token to config
-        const token_json = std.fmt.allocPrint(allocator, "\"{s}\"", .{result.bot_token}) catch {
-            std.debug.print("\nCould not format token for config. Add manually:\n", .{});
-            printManualWeixinConfig(result.bot_token, result.base_url);
-            return;
+        _ = mutateStoredWeixinCredentials(allocator, .{ .login = .{
+            .token = result.bot_token,
+            .base_url = result.base_url,
+            .proxy = opts.proxy,
+        } }) catch {
+            // Never print the bot token: fix the config error and repeat login instead.
+            std.debug.print("\nCould not auto-save Weixin credentials. Fix the config and repeat login.\n", .{});
+            // NOTE: This process-exit path is not unit-tested because it would terminate the test runner.
+            std.process.exit(1);
         };
-        defer allocator.free(token_json);
-
-        _ = config_mutator.mutateDefaultConfig(
-            allocator,
-            .set,
-            "channels.weixin.token",
-            token_json,
-            .{ .apply = true },
-        ) catch {
-            std.debug.print("\nCould not auto-save config. Add manually:\n", .{});
-            printManualWeixinConfig(result.bot_token, result.base_url);
-            return;
-        };
-
-        // Save base_url if it differs from default
-        if (!std.mem.eql(u8, result.base_url, "https://ilinkai.weixin.qq.com/")) {
-            const base_url_json = std.fmt.allocPrint(allocator, "\"{s}\"", .{result.base_url}) catch return;
-            defer allocator.free(base_url_json);
-            _ = config_mutator.mutateDefaultConfig(
-                allocator,
-                .set,
-                "channels.weixin.base_url",
-                base_url_json,
-                .{ .apply = true },
-            ) catch {};
-        }
 
         std.debug.print("\nConfig updated. Start the gateway with:\n", .{});
         std.debug.print("  nullclaw gateway\n\n", .{});
-        std.debug.print("To restrict which WeChat users can send messages, add their user IDs\n", .{});
-        std.debug.print("to channels.weixin.allow_from in your config.\n", .{});
+        std.debug.print("No inbound messages are accepted until allow_from on the updated\n", .{});
+        std.debug.print("Weixin account lists trusted user IDs (or an intentional \"*\").\n", .{});
     } else if (std.mem.eql(u8, subcmd, "status")) {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
@@ -5574,14 +5815,11 @@ fn runAuthWeixin(allocator: std.mem.Allocator, subcmd: []const u8, args: []const
 
         if (cfg.channels.weixinPrimary()) |weixin_cfg| {
             if (weixin_cfg.token.len > 0) {
-                std.debug.print("weixin: authenticated\n", .{});
-                std.debug.print("  Token: {s}...{s}\n", .{
-                    weixin_cfg.token[0..@min(8, weixin_cfg.token.len)],
-                    if (weixin_cfg.token.len > 8) weixin_cfg.token[weixin_cfg.token.len - 4 ..] else "",
-                });
+                std.debug.print("weixin: token configured\n", .{});
+                // Do not print token material; status reports configuration, not remote validity.
                 std.debug.print("  Base URL: {s}\n", .{weixin_cfg.base_url});
             } else {
-                std.debug.print("weixin: not authenticated (token empty)\n", .{});
+                std.debug.print("weixin: not configured (token empty)\n", .{});
                 std.debug.print("  Run `nullclaw auth login weixin` to authenticate.\n", .{});
             }
         } else {
@@ -5589,33 +5827,20 @@ fn runAuthWeixin(allocator: std.mem.Allocator, subcmd: []const u8, args: []const
             std.debug.print("  Run `nullclaw auth login weixin` to authenticate.\n", .{});
         }
     } else if (std.mem.eql(u8, subcmd, "logout")) {
-        _ = config_mutator.mutateDefaultConfig(
-            allocator,
-            .unset,
-            "channels.weixin.token",
-            null,
-            .{ .apply = true },
-        ) catch |err| {
+        const changed = mutateStoredWeixinCredentials(allocator, .logout) catch |err| {
             std.debug.print("Failed to remove weixin credentials: {s}\n", .{@errorName(err)});
             return;
         };
-        std.debug.print("weixin: credentials removed.\n", .{});
+        if (changed) {
+            std.debug.print("weixin: credentials removed.\n", .{});
+        } else {
+            std.debug.print("weixin: no configured credentials to remove.\n", .{});
+        }
     } else {
         std.debug.print("Unknown auth command: {s}\n\n", .{subcmd});
         printAuthUsage();
         std.process.exit(1);
     }
-}
-
-fn printManualWeixinConfig(token: []const u8, base_url: []const u8) void {
-    std.debug.print("\nAdd the following to the channels section of your nullclaw config:\n\n", .{});
-    std.debug.print("  \"weixin\": [{{\n", .{});
-    std.debug.print("    \"token\": \"{s}\",\n", .{token});
-    if (!std.mem.eql(u8, base_url, "https://ilinkai.weixin.qq.com/")) {
-        std.debug.print("    \"base_url\": \"{s}\",\n", .{base_url});
-    }
-    std.debug.print("    \"allow_from\": []\n", .{});
-    std.debug.print("  }}]\n", .{});
 }
 
 fn runAuthDeviceCodeLogin(
@@ -6186,6 +6411,266 @@ test "writeJsonString wraps and escapes special characters" {
     try std.testing.expectEqualStrings("\"line \\\"one\\\"\\nline two\\\\\"", written);
 }
 
+test "weixin timeout parsing rejects zero and overflow" {
+    try std.testing.expectEqual(@as(u64, 5 * std.time.ns_per_s), try parseWeixinTimeoutNs("5"));
+    try std.testing.expectError(error.InvalidTimeout, parseWeixinTimeoutNs("0"));
+    try std.testing.expectError(error.Overflow, parseWeixinTimeoutNs("18446744073709551615"));
+}
+
+test "weixin credential update round trips escaped credentials" {
+    const channel_json = try updateWeixinChannelJson(std.testing.allocator, null, .{ .login = .{
+        .token = "token-\"line\nnext",
+        .base_url = "https://region.example.com/",
+        .proxy = "http://127.0.0.1:7890",
+    } });
+    defer std.testing.allocator.free(channel_json);
+    const rendered = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"channels\":{{\"weixin\":{s}}}}}",
+        .{channel_json},
+    );
+    defer std.testing.allocator.free(rendered);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .allocator = arena.allocator(),
+    };
+    try cfg.parseJson(rendered);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.channels.weixin.len);
+    const weixin = cfg.channels.weixin[0];
+    try std.testing.expectEqualStrings("token-\"line\nnext", weixin.token);
+    try std.testing.expectEqualStrings("https://region.example.com/", weixin.base_url);
+    try std.testing.expectEqualStrings("http://127.0.0.1:7890", weixin.proxy.?);
+    try std.testing.expectEqual(@as(usize, 0), weixin.allow_from.len);
+}
+
+test "weixin credential update preserves primary account settings" {
+    const current =
+        \\{
+        \\  "accounts": {
+        \\    "backup": {"token":"keep","allow_from":["backup-user"]},
+        \\    "default": {"token":"old","base_url":"https://stale.example.com/","proxy":"http://127.0.0.1:7890","allow_from":["primary-user"]}
+        \\  },
+        \\  "token": "ignored-legacy-token",
+        \\  "base_url": "https://ignored.example.com/"
+        \\}
+    ;
+    const updated = try updateWeixinChannelJson(std.testing.allocator, current, .{ .login = .{
+        .token = "new-token",
+        .base_url = DEFAULT_WEIXIN_BASE_URL,
+        .proxy = null,
+    } });
+    defer std.testing.allocator.free(updated);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, updated, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("token") == null);
+    try std.testing.expect(parsed.value.object.get("base_url") == null);
+
+    const accounts = parsed.value.object.get("accounts").?.object;
+    const primary = accounts.get("default").?.object;
+    try std.testing.expectEqualStrings("new-token", primary.get("token").?.string);
+    try std.testing.expect(primary.get("base_url") == null);
+    try std.testing.expectEqualStrings("http://127.0.0.1:7890", primary.get("proxy").?.string);
+    try std.testing.expectEqualStrings("primary-user", primary.get("allow_from").?.array.items[0].string);
+    try std.testing.expectEqualStrings("keep", accounts.get("backup").?.object.get("token").?.string);
+
+    const rendered = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"channels\":{{\"weixin\":{s}}}}}",
+        .{updated},
+    );
+    defer std.testing.allocator.free(rendered);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .allocator = arena.allocator(),
+    };
+    try cfg.parseJson(rendered);
+    try std.testing.expectEqualStrings("new-token", cfg.channels.weixinPrimary().?.token);
+}
+
+test "weixin credential update selects lexical account and overwrites proxy" {
+    const current =
+        \\{"accounts":{"zeta":{"token":"keep"},"alpha":{"token":"old","proxy":"http://127.0.0.1:7000"}}}
+    ;
+    const updated = try updateWeixinChannelJson(std.testing.allocator, current, .{ .login = .{
+        .token = "new-token",
+        .base_url = "https://region.example.com/",
+        .proxy = "socks5://127.0.0.1:1080",
+    } });
+    defer std.testing.allocator.free(updated);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, updated, .{});
+    defer parsed.deinit();
+    const accounts = parsed.value.object.get("accounts").?.object;
+    const selected = accounts.get("alpha").?.object;
+    try std.testing.expectEqualStrings("new-token", selected.get("token").?.string);
+    try std.testing.expectEqualStrings("https://region.example.com/", selected.get("base_url").?.string);
+    try std.testing.expectEqualStrings("socks5://127.0.0.1:1080", selected.get("proxy").?.string);
+    try std.testing.expectEqualStrings("keep", accounts.get("zeta").?.object.get("token").?.string);
+}
+
+test "weixin credential update migrates legacy arrays without dropping accounts" {
+    const current =
+        \\[
+        \\  {"account_id":"main","token":"old","allow_from":["main-user"]},
+        \\  {"account_id":"backup","token":"keep","allow_from":["backup-user"]}
+        \\]
+    ;
+    const updated = try updateWeixinChannelJson(std.testing.allocator, current, .{ .login = .{
+        .token = "new-token",
+        .base_url = DEFAULT_WEIXIN_BASE_URL,
+        .proxy = null,
+    } });
+    defer std.testing.allocator.free(updated);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, updated, .{});
+    defer parsed.deinit();
+    const accounts = parsed.value.object.get("accounts").?.object;
+    try std.testing.expectEqual(@as(usize, 2), accounts.count());
+    try std.testing.expectEqualStrings("new-token", accounts.get("main").?.object.get("token").?.string);
+    try std.testing.expectEqualStrings("main-user", accounts.get("main").?.object.get("allow_from").?.array.items[0].string);
+    try std.testing.expectEqualStrings("keep", accounts.get("backup").?.object.get("token").?.string);
+    try std.testing.expectEqualStrings("backup-user", accounts.get("backup").?.object.get("allow_from").?.array.items[0].string);
+}
+
+test "weixin login preserves inline settings beside empty accounts" {
+    const current =
+        \\{"accounts":{},"token":"old","base_url":"https://old.example.com/","proxy":"http://127.0.0.1:7890","allow_from":["trusted-user"]}
+    ;
+    const updated = try updateWeixinChannelJson(std.testing.allocator, current, .{ .login = .{
+        .token = "new-token",
+        .base_url = DEFAULT_WEIXIN_BASE_URL,
+        .proxy = null,
+    } });
+    defer std.testing.allocator.free(updated);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, updated, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("accounts").?.object.count());
+    try std.testing.expectEqualStrings("new-token", parsed.value.object.get("token").?.string);
+    try std.testing.expect(parsed.value.object.get("base_url") == null);
+    try std.testing.expectEqualStrings("http://127.0.0.1:7890", parsed.value.object.get("proxy").?.string);
+    try std.testing.expectEqualStrings("trusted-user", parsed.value.object.get("allow_from").?.array.items[0].string);
+
+    const rendered = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"channels\":{{\"weixin\":{s}}}}}",
+        .{updated},
+    );
+    defer std.testing.allocator.free(rendered);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .allocator = arena.allocator(),
+    };
+    try cfg.parseJson(rendered);
+    const weixin = cfg.channels.weixinPrimary().?;
+    try std.testing.expectEqualStrings("new-token", weixin.token);
+    try std.testing.expectEqualStrings("http://127.0.0.1:7890", weixin.proxy.?);
+    try std.testing.expectEqualStrings("trusted-user", weixin.allow_from[0]);
+}
+
+test "weixin logout removes only preferred account credentials" {
+    const current =
+        \\{"accounts":{"default":{"token":"remove","allow_from":["primary-user"]},"backup":{"token":"keep"}},"token":"ignored"}
+    ;
+    const updated = try updateWeixinChannelJson(std.testing.allocator, current, .logout);
+    defer std.testing.allocator.free(updated);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, updated, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("token") == null);
+    const accounts = parsed.value.object.get("accounts").?.object;
+    try std.testing.expect(accounts.get("default").?.object.get("token") == null);
+    try std.testing.expectEqualStrings("primary-user", accounts.get("default").?.object.get("allow_from").?.array.items[0].string);
+    try std.testing.expectEqualStrings("keep", accounts.get("backup").?.object.get("token").?.string);
+}
+
+test "weixin logout does not create a missing account" {
+    const updated = try updateWeixinChannelJson(
+        std.testing.allocator,
+        "{\"accounts\":{},\"token\":\"active-token\",\"base_url\":\"https://stale.example.com/\",\"proxy\":\"http://127.0.0.1:7890\"}",
+        .logout,
+    );
+    defer std.testing.allocator.free(updated);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, updated, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.object.get("accounts").?.object.count());
+    try std.testing.expect(parsed.value.object.get("token") == null);
+    try std.testing.expectEqualStrings("https://stale.example.com/", parsed.value.object.get("base_url").?.string);
+    try std.testing.expectEqualStrings("http://127.0.0.1:7890", parsed.value.object.get("proxy").?.string);
+
+    const rendered = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"channels\":{{\"weixin\":{s}}}}}",
+        .{updated},
+    );
+    defer std.testing.allocator.free(rendered);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .allocator = arena.allocator(),
+    };
+    try cfg.parseJson(rendered);
+    try std.testing.expectEqual(@as(usize, 0), cfg.channels.weixinPrimary().?.token.len);
+}
+
+test "weixin credential update rejects invalid accounts shape" {
+    try std.testing.expectError(
+        error.InvalidWeixinConfig,
+        updateWeixinChannelJson(std.testing.allocator, "{\"accounts\":[]}", .logout),
+    );
+}
+
+test "weixin login rejects malformed selected account" {
+    try std.testing.expectError(
+        error.InvalidWeixinConfig,
+        updateWeixinChannelJson(
+            std.testing.allocator,
+            "{\"accounts\":{\"default\":{\"allow_from\":\"alice\"},\"backup\":{\"token\":\"keep\"}}}",
+            .{ .login = .{
+                .token = "new-token",
+                .base_url = DEFAULT_WEIXIN_BASE_URL,
+                .proxy = null,
+            } },
+        ),
+    );
+}
+
+test "weixin login ignores malformed account entries like config parsing" {
+    const updated = try updateWeixinChannelJson(
+        std.testing.allocator,
+        "{\"accounts\":{\"default\":false,\"backup\":{\"token\":\"old\"}}}",
+        .{ .login = .{
+            .token = "new-token",
+            .base_url = DEFAULT_WEIXIN_BASE_URL,
+            .proxy = null,
+        } },
+    );
+    defer std.testing.allocator.free(updated);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, updated, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("accounts").?.object.get("default").? == .bool);
+    try std.testing.expectEqualStrings(
+        "new-token",
+        parsed.value.object.get("accounts").?.object.get("backup").?.object.get("token").?.string,
+    );
+}
+
 test "skillSource distinguishes workspace and community skills" {
     const workspace_dir = "/tmp/ws";
     const community_base = "/tmp/home/.nullclaw/skills";
@@ -6446,17 +6931,9 @@ test "hasStartupProviderCredentials accepts local compatible provider without ap
 }
 
 test "hasStartupProviderCredentials accepts gemini oauth env token" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-    const c = @cImport({
-        @cInclude("stdlib.h");
-    });
-
-    const env_name = try std.testing.allocator.dupeZ(u8, "GEMINI_OAUTH_TOKEN");
-    defer std.testing.allocator.free(env_name);
-    const env_value = try std.testing.allocator.dupeZ(u8, "ya29.test-oauth-token");
-    defer std.testing.allocator.free(env_value);
-    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, env_value.ptr, 1));
-    defer _ = c.unsetenv(env_name.ptr);
+    var env_guard = try yc.platform.TestEnvGuard.capture(std.testing.allocator, &.{"GEMINI_OAUTH_TOKEN"});
+    defer env_guard.deinit();
+    try yc.platform.setProcessEnv(std.testing.allocator, "GEMINI_OAUTH_TOKEN", "ya29.test-oauth-token");
 
     const cfg = yc.config.Config{
         .workspace_dir = "/tmp/nullclaw-test",
@@ -6500,7 +6977,20 @@ test "hasStartupProviderCredentials rejects blank configured key" {
 }
 
 test "hasStartupProviderCredentials rejects missing provider and fallback credentials" {
-    // Regression: channel startup must still fail fast when neither the primary provider nor fallbacks can authenticate.
+    // Regression: channel startup must still fail fast when neither the primary
+    // provider nor fallbacks can authenticate. This test is non-hermetic against
+    // env vars leaking from the developer shell — production code's env-var
+    // fallback (api_key.zig) is intentional, so the test must explicitly
+    // save/unset/restore those vars to hold its "no credentials" premise.
+    const env_vars = [_][]const u8{
+        "ANTHROPIC_OAUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "NULLCLAW_API_KEY",
+        "API_KEY",
+    };
+    var env_guard = try yc.platform.TestEnvGuard.captureAndClear(std.testing.allocator, &env_vars);
+    defer env_guard.deinit();
+
     const cfg = yc.config.Config{
         .workspace_dir = "/tmp/nullclaw-test",
         .config_path = "/tmp/nullclaw-test/config.json",
@@ -6528,7 +7018,7 @@ test "parseCronAddAgentOptions preserves delivery account flag" {
         "--account",
         "main",
         "--to",
-        "7972814626",
+        "chat-42",
     };
 
     const options = try parseCronAddAgentOptions(&args);
@@ -6537,10 +7027,28 @@ test "parseCronAddAgentOptions preserves delivery account flag" {
     try std.testing.expectEqual(yc.cron.DeliveryMode.always, options.delivery.mode);
     try std.testing.expectEqualStrings("telegram", options.delivery.channel.?);
     try std.testing.expectEqualStrings("main", options.delivery.account_id.?);
-    try std.testing.expectEqualStrings("7972814626", options.delivery.to.?);
+    try std.testing.expectEqualStrings("chat-42", options.delivery.to.?);
     try std.testing.expect(!options.delivery.channel_owned);
     try std.testing.expect(!options.delivery.account_id_owned);
     try std.testing.expect(!options.delivery.to_owned);
+}
+
+test "parseCronAgentOptions rejects missing option values" {
+    // Regression: malformed cron agent flags must fail fast instead of being ignored.
+    const flags = [_][]const u8{ "--model", "--session-target", "--channel", "--account", "--to" };
+    for (flags) |flag| {
+        const args = [_][]const u8{ "once-agent", "30s", "Summarize status", flag };
+        try std.testing.expectError(error.MissingCronOptionValue, parseCronAgentOptions(&args, 3));
+
+        const followed_by_flag = [_][]const u8{ "once-agent", "30s", "Summarize status", flag, "--announce" };
+        try std.testing.expectError(error.MissingCronOptionValue, parseCronAgentOptions(&followed_by_flag, 3));
+    }
+}
+
+test "parseCronAgentOptions rejects unknown options" {
+    // Regression: cron agent CLI typos must not be silently ignored.
+    const args = [_][]const u8{ "once-agent", "30s", "Summarize status", "--unknown" };
+    try std.testing.expectError(error.UnknownCronOption, parseCronAgentOptions(&args, 3));
 }
 
 test "appendAgentInvokeResponseJson renders machine-readable turn payload" {

@@ -407,6 +407,8 @@ fn codexStreamRequest(
 
     argv_buf[argc] = "curl";
     argc += 1;
+    argv_buf[argc] = "-q";
+    argc += 1;
     argv_buf[argc] = "-s";
     argc += 1;
     argv_buf[argc] = "--no-buffer";
@@ -420,16 +422,8 @@ fn codexStreamRequest(
     argv_buf[argc] = "POST";
     argc += 1;
 
-    // Add proxy from environment if set
-    const proxy = http_util.getProxyFromEnv(allocator) catch null;
-    defer if (proxy) |p| allocator.free(p);
-
-    if (proxy) |p| {
-        argv_buf[argc] = "--proxy";
-        argc += 1;
-        argv_buf[argc] = p;
-        argc += 1;
-    }
+    var curl_config = try http_util.prepareProtectedCurlConfigFromEnvironment(allocator, url);
+    defer curl_config.deinit();
 
     var timeout_buf: [32]u8 = undefined;
     if (timeout_secs > 0) {
@@ -478,7 +472,9 @@ fn codexStreamRequest(
     argc += 1;
     argv_buf[argc] = "@-";
     argc += 1;
-    argv_buf[argc] = url;
+    argv_buf[argc] = "--config";
+    argc += 1;
+    argv_buf[argc] = curl_config.path();
     argc += 1;
 
     var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);

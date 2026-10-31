@@ -1357,6 +1357,7 @@ pub const Config = struct {
             .max_history_messages = self.agent.max_history_messages,
             .parallel_tools = self.agent.parallel_tools,
             .tool_dispatcher = self.agent.tool_dispatcher,
+            .default_queue_mode = self.agent.default_queue_mode,
             .session_idle_timeout_secs = self.agent.session_idle_timeout_secs,
             .compaction_keep_recent = self.agent.compaction_keep_recent,
             .compaction_max_summary_chars = self.agent.compaction_max_summary_chars,
@@ -1541,6 +1542,8 @@ pub const Config = struct {
         InvalidRetryCount,
         InvalidBackoffMs,
         InvalidHttpProxyUrl,
+        InvalidWeixinBaseUrl,
+        InvalidWeixinProxyUrl,
         InvalidApiErrorMaxChars,
         InvalidOtelEndpoint,
         InvalidOtelHeader,
@@ -1633,6 +1636,16 @@ pub const Config = struct {
         if (self.http_request.proxy) |proxy_url| {
             if (!config_types.HttpRequestConfig.isValidProxyUrl(proxy_url)) {
                 return ValidationError.InvalidHttpProxyUrl;
+            }
+        }
+        for (self.channels.weixin) |weixin_cfg| {
+            if (!config_types.WeixinConfig.isValidBaseUrl(weixin_cfg.base_url)) {
+                return ValidationError.InvalidWeixinBaseUrl;
+            }
+            if (weixin_cfg.proxy) |proxy_url| {
+                if (!config_types.WeixinConfig.isValidProxyUrl(proxy_url)) {
+                    return ValidationError.InvalidWeixinProxyUrl;
+                }
             }
         }
         if (self.diagnostics.api_error_max_chars) |n| {
@@ -1824,6 +1837,8 @@ pub const Config = struct {
             ValidationError.InvalidRetryCount => std.debug.print("Config error: provider_retries must be <= 100.\n", .{}),
             ValidationError.InvalidBackoffMs => std.debug.print("Config error: provider_backoff_ms must be <= 600000.\n", .{}),
             ValidationError.InvalidHttpProxyUrl => std.debug.print("Config error: http_request.proxy must be a non-empty http://, https://, or socks5:// URL.\n", .{}),
+            ValidationError.InvalidWeixinBaseUrl => std.debug.print("Config error: channels.weixin base_url must be an absolute HTTPS URL without a query or fragment.\n", .{}),
+            ValidationError.InvalidWeixinProxyUrl => std.debug.print("Config error: channels.weixin proxy must be a valid http://, https://, or socks5:// proxy URL.\n", .{}),
             ValidationError.InvalidApiErrorMaxChars => std.debug.print("Config error: diagnostics.api_error_max_chars must be in [200, 10000].\n", .{}),
             ValidationError.InvalidOtelEndpoint => std.debug.print("Config error: diagnostics.otel.endpoint/otel_endpoint must be an absolute https:// URL (or http:// for localhost/private or container-local collector hosts).\n", .{}),
             ValidationError.InvalidOtelHeader => std.debug.print("Config error: diagnostics.otel.headers/otel_headers must contain valid HTTP header names/values (no CR/LF).\n", .{}),
@@ -2575,6 +2590,21 @@ test "json parse memory weights accept integer values" {
     try std.testing.expectEqual(@as(f64, 0.0), cfg.memory.search.query.hybrid.text_weight);
 }
 
+test "json parse memory database path" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"memory":{"database_path":"/var/lib/nullclaw/dialogs.db"}}
+    ;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+    };
+    try cfg.parseJson(json);
+    defer allocator.free(cfg.memory.database_path);
+    try std.testing.expectEqualStrings("/var/lib/nullclaw/dialogs.db", cfg.memory.database_path);
+}
+
 test "json parse memory sqlite_ann store options" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2678,7 +2708,7 @@ test "save roundtrip preserves extended config sections" {
     };
 
     cfg.runtime.kind = "docker";
-    cfg.runtime.docker.image = "alpine:3.20";
+    cfg.runtime.docker.image = "example.com/nullclaw/runtime:test";
     cfg.runtime.docker.network = "bridge";
     cfg.runtime.docker.memory_limit_mb = 768;
     cfg.runtime.docker.read_only_rootfs = false;
@@ -2835,6 +2865,7 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqualStrings("OPENROUTER_API_KEY", loaded.mcp_servers[0].env[0].key);
 
     try std.testing.expectEqualStrings("docker", loaded.runtime.kind);
+    try std.testing.expectEqualStrings("example.com/nullclaw/runtime:test", loaded.runtime.docker.image);
     try std.testing.expectEqual(@as(u32, 32), loaded.scheduler.max_tasks);
     try std.testing.expectEqual(@as(u64, 123), loaded.scheduler.agent_timeout_secs);
     try std.testing.expectEqual(@as(u32, 1500), loaded.messages.inbound.debounce_ms);
@@ -2971,6 +3002,7 @@ test "save outputs pretty-printed nested sections" {
     cfg.security.audit.enabled = true;
     cfg.agent.compact_context = true;
     cfg.agent.max_tool_iterations = 42;
+    cfg.agent.default_queue_mode = .latest;
     try cfg.save();
 
     const file = try std_compat.fs.openFileAbsolute(config_path, .{});
@@ -2990,6 +3022,7 @@ test "save outputs pretty-printed nested sections" {
     try std.testing.expect(std.mem.indexOf(u8, content, "    \"sandbox\": {\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "      \"enabled\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "    \"max_tool_iterations\": 42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "    \"default_queue_mode\": \"latest\"") != null);
 
     // Roundtrip: values must survive parse
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -3004,6 +3037,8 @@ test "save outputs pretty-printed nested sections" {
     try std.testing.expect(loaded.security.audit.enabled);
     try std.testing.expect(loaded.agent.compact_context);
     try std.testing.expectEqual(@as(u32, 42), loaded.agent.max_tool_iterations);
+    // Regression: Config.save must not silently erase a non-off queue default.
+    try std.testing.expectEqual(config_types.QueueMode.latest, loaded.agent.default_queue_mode);
 }
 
 test "save escapes string arrays safely" {
@@ -3340,6 +3375,39 @@ test "validation rejects invalid http_request proxy URL" {
     };
     cfg.http_request.proxy = "ftp://proxy.example.com:21";
     try std.testing.expectError(Config.ValidationError.InvalidHttpProxyUrl, cfg.validate());
+}
+
+test "validation rejects insecure weixin base URL" {
+    const weixin_accounts = [_]config_types.WeixinConfig{.{
+        .token = "test-token",
+        .base_url = "http://ilink.example.com/",
+    }};
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+    };
+    cfg.channels.weixin = &weixin_accounts;
+
+    // Regression: bearer credentials must never be sent over plaintext HTTP.
+    try std.testing.expectError(Config.ValidationError.InvalidWeixinBaseUrl, cfg.validate());
+}
+
+test "validation rejects invalid weixin proxy URL" {
+    const weixin_accounts = [_]config_types.WeixinConfig{.{
+        .token = "test-token",
+        .proxy = "ftp://proxy.example.com",
+    }};
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+    };
+    cfg.channels.weixin = &weixin_accounts;
+
+    try std.testing.expectError(Config.ValidationError.InvalidWeixinProxyUrl, cfg.validate());
 }
 
 test "validation rejects out-of-range diagnostics api_error_max_chars" {
@@ -6674,6 +6742,43 @@ test "parse agents.defaults.heartbeat dispatch settings" {
     try std.testing.expectEqualStrings("-100123", cfg.heartbeat.delivery_peer_id.?);
     try std.testing.expectEqualStrings("77", cfg.heartbeat.delivery_thread_id.?);
     try std.testing.expect(!cfg.heartbeat.delivery_best_effort);
+}
+
+test "parse agent.default_queue_mode" {
+    // Regression: configured queue policy must be parsed before Agent creation.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"agent":{"default_queue_mode":"latest"}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(config_types.QueueMode.latest, cfg.agent.default_queue_mode);
+}
+
+test "agent.default_queue_mode defaults to serial" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json = "{}";
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(config_types.QueueMode.serial, cfg.agent.default_queue_mode);
+}
+
+test "agent.default_queue_mode rejects invalid values" {
+    // Regression: a typo must not silently fall back to off and drop busy-session messages.
+    const allocator = std.testing.allocator;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try std.testing.expectError(
+        error.InvalidDefaultQueueMode,
+        cfg.parseJson("{\"agent\":{\"default_queue_mode\":\"lastest\"}}"),
+    );
+    try std.testing.expectError(
+        error.InvalidDefaultQueueMode,
+        cfg.parseJson("{\"agent\":{\"default_queue_mode\":42}}"),
+    );
 }
 
 test "save roundtrip preserves heartbeat dispatch settings" {

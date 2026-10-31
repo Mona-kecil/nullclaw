@@ -85,6 +85,8 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "venice", .url = "https://api.venice.ai", .display = "Venice" },
     .{ .name = "nearai", .url = "https://cloud-api.near.ai/v1", .display = "NEAR AI Cloud" },
     .{ .name = "atlas-cloud", .url = "https://api.atlascloud.ai/v1", .display = "Atlas Cloud" },
+    .{ .name = "evolink", .url = "https://direct.evolink.ai/v1", .display = "Evolink" },
+    .{ .name = "edenai", .url = "https://api.edenai.run/v3", .display = "Eden AI" },
     .{ .name = "vercel", .url = "https://ai-gateway.vercel.sh/v1", .display = "Vercel AI Gateway" },
     .{ .name = "vercel-ai", .url = "https://ai-gateway.vercel.sh/v1", .display = "Vercel AI Gateway" },
     .{ .name = "together", .url = "https://api.together.xyz", .display = "Together AI" },
@@ -591,6 +593,9 @@ test "classifyProvider identifies known providers" {
     try std.testing.expect(classifyProvider("atlas-cloud") == .compatible_provider);
     try std.testing.expect(classifyProvider("atlas") == .compatible_provider);
     try std.testing.expect(classifyProvider("atlascloud") == .compatible_provider);
+    try std.testing.expect(classifyProvider("evolink") == .compatible_provider);
+    try std.testing.expect(classifyProvider("edenai") == .compatible_provider);
+    try std.testing.expect(classifyProvider("eden-ai") == .compatible_provider);
     try std.testing.expect(classifyProvider("poe") == .compatible_provider);
     try std.testing.expect(classifyProvider("custom:https://example.com") == .compatible_provider);
     try std.testing.expect(classifyProvider("openai-codex") == .openai_codex_provider);
@@ -633,8 +638,11 @@ test "compatibleProviderUrl returns correct URLs" {
     try std.testing.expectEqualStrings("https://api.venice.ai", compatibleProviderUrl("venice").?);
     try std.testing.expectEqualStrings("https://cloud-api.near.ai/v1", compatibleProviderUrl("nearai").?);
     try std.testing.expectEqualStrings("https://api.atlascloud.ai/v1", compatibleProviderUrl("atlas-cloud").?);
+    try std.testing.expectEqualStrings("https://api.edenai.run/v3", compatibleProviderUrl("edenai").?);
+    try std.testing.expectEqualStrings("https://api.edenai.run/v3", compatibleProviderUrl("eden-ai").?);
     try std.testing.expectEqualStrings("https://api.atlascloud.ai/v1", compatibleProviderUrl("atlas").?);
     try std.testing.expectEqualStrings("https://api.atlascloud.ai/v1", compatibleProviderUrl("atlascloud").?);
+    try std.testing.expectEqualStrings("https://direct.evolink.ai/v1", compatibleProviderUrl("evolink").?);
     try std.testing.expectEqualStrings("https://api.groq.com/openai/v1", compatibleProviderUrl("groq").?);
     try std.testing.expectEqualStrings("https://api.deepseek.com", compatibleProviderUrl("deepseek").?);
     try std.testing.expectEqualStrings("https://api.poe.com/v1", compatibleProviderUrl("poe").?);
@@ -750,6 +758,7 @@ test "new providers display names" {
     try std.testing.expectEqualStrings("Atlas Cloud", compatibleProviderDisplayName("atlas-cloud"));
     try std.testing.expectEqualStrings("Atlas Cloud", compatibleProviderDisplayName("atlas"));
     try std.testing.expectEqualStrings("Atlas Cloud", compatibleProviderDisplayName("atlascloud"));
+    try std.testing.expectEqualStrings("Evolink", compatibleProviderDisplayName("evolink"));
     try std.testing.expectEqualStrings("Xiaomi MiMo", compatibleProviderDisplayName("xiaomi"));
     try std.testing.expectEqualStrings("Xiaomi MiMo", compatibleProviderDisplayName("xiaomi-mimo"));
     try std.testing.expectEqualStrings("Xiaomi MiMo", compatibleProviderDisplayName("mimo"));
@@ -833,6 +842,11 @@ test "findCompatProvider returns correct flags" {
     const atlas = findCompatProvider("atlas").?;
     try std.testing.expect(!atlas.no_responses_fallback);
     try std.testing.expect(atlas.auth_style == .bearer);
+
+    // Evolink is an OpenAI-compatible Bearer-token provider.
+    const evolink = findCompatProvider("evolink").?;
+    try std.testing.expect(!evolink.no_responses_fallback);
+    try std.testing.expect(evolink.auth_style == .bearer);
 
     // minimax-cn also has both flags
     const minimax_cn = findCompatProvider("minimax-cn").?;
@@ -957,6 +971,16 @@ test "fromConfig configures Atlas Cloud compatible provider" {
     try std.testing.expect(h == .compatible);
     try std.testing.expectEqualStrings("https://api.atlascloud.ai/v1", h.compatible.base_url);
     try std.testing.expectEqualStrings("atlas-cloud", h.compatible.name);
+    try std.testing.expect(h.compatible.supports_responses_fallback);
+}
+
+test "fromConfig configures Evolink compatible provider" {
+    const alloc = std.testing.allocator;
+    var h = ProviderHolder.fromConfig(alloc, "evolink", "key", null, true, null, null, false, null);
+    defer h.deinit();
+    try std.testing.expect(h == .compatible);
+    try std.testing.expectEqualStrings("https://direct.evolink.ai/v1", h.compatible.base_url);
+    try std.testing.expectEqualStrings("evolink", h.compatible.name);
     try std.testing.expect(h.compatible.supports_responses_fallback);
 }
 

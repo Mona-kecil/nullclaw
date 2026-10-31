@@ -113,9 +113,9 @@ Notes:
 | `nullclaw cron list [--json]` | List scheduled tasks |
 | `nullclaw cron status [--json]` | Show scheduler-level status and job counters |
 | `nullclaw cron add "0 * * * *" "command"` | Add a recurring shell task |
-| `nullclaw cron add-agent "0 * * * *" "prompt" --model <model> [--announce] [--channel <name>] [--account <id>] [--to <id>]` | Add a recurring agent task |
+| `nullclaw cron add-agent "0 * * * *" "prompt" [--model <model>] [--session-target <isolated\|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>]` | Add a recurring agent task |
 | `nullclaw cron once 10m "command"` | Add a one-shot delayed shell task |
-| `nullclaw cron once-agent 10m "prompt" --model <model>` | Add a one-shot delayed agent task |
+| `nullclaw cron once-agent 10m "prompt" [--model <model>] [--session-target <isolated\|main>] [--announce] [--channel <name>] [--account <id>] [--to <id>]` | Add a one-shot delayed agent task |
 | `nullclaw cron run <id>` | Run a task immediately |
 | `nullclaw cron pause <id>` / `resume <id>` | Pause or resume a task |
 | `nullclaw cron remove <id>` | Delete a task |
@@ -215,7 +215,7 @@ These are more useful for automation, probing, or integrations than for normal d
 | Command | Purpose |
 |---|---|
 | `nullclaw --export-manifest` | Export the runtime manifest |
-| `nullclaw --list-models` | Print model information |
+| `nullclaw --list-models --provider <name> [--api-key <key>] [--base-url <url>]` | Print model information, including custom OpenAI-compatible endpoints |
 | `nullclaw --probe-provider-health` | Probe provider health |
 | `nullclaw --probe-channel-health` | Probe channel health |
 | `nullclaw --from-json` | Run a JSON-driven entry path |

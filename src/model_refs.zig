@@ -69,6 +69,8 @@ const known_url_model_provider_namespaces = std.StaticStringMap(void).initCompti
     .{ "venice", {} },
     .{ "nearai", {} },
     .{ "atlas-cloud", {} },
+    .{ "evolink", {} },
+    .{ "edenai", {} },
     .{ "vercel-ai", {} },
     .{ "poe", {} },
     .{ "xiaomi", {} },
@@ -229,6 +231,12 @@ test "splitProviderModel keeps atlas cloud namespace on versionless custom urls"
     const alias_split = splitProviderModel("custom:https://gateway.example.com/atlascloud/qwen/qwen3-32b") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("custom:https://gateway.example.com", alias_split.provider.?);
     try std.testing.expectEqualStrings("atlascloud/qwen/qwen3-32b", alias_split.model);
+}
+
+test "splitProviderModel keeps evolink namespace on versionless custom urls" {
+    const split = splitProviderModel("custom:https://gateway.example.com/evolink/gpt-5.2") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("custom:https://gateway.example.com", split.provider.?);
+    try std.testing.expectEqualStrings("evolink/gpt-5.2", split.model);
 }
 
 test "splitProviderModel preserves explicit responses endpoint suffix" {

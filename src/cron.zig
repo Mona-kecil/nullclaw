@@ -14,6 +14,7 @@ const signal = @import("channels/signal.zig");
 const Config = @import("config.zig").Config;
 const process_util = @import("tools/process_util.zig");
 const security_policy = @import("security/policy.zig");
+const secrets = @import("security/secrets.zig");
 
 const log = std.log.scoped(.cron);
 const DEFAULT_CRON_SHELL_TIMEOUT_NS: u64 = 60 * std.time.ns_per_s;
@@ -981,7 +982,7 @@ pub const CronScheduler = struct {
                             }
                         }
                     } else {
-                        const exec_result = runAgentJob(self.allocator, self.shell_cwd, agent_output, job.model, self.agent_timeout_secs) catch |err| {
+                        const exec_result = runAgentJob(self.allocator, self.shell_cwd, agent_output, job.model, self.agent_timeout_secs, job.delivery) catch |err| {
                             log.err("cron agent job '{s}' execution failed: {s}", .{ job.id, @errorName(err) });
                             job.last_run_secs = now;
                             job.last_status = "error";
@@ -1086,8 +1087,16 @@ fn runAgentJob(
     prompt: []const u8,
     model: ?[]const u8,
     timeout_secs: u64,
+    delivery: DeliveryConfig,
 ) !AgentRunResult {
-    return agent_runner.run(allocator, cwd, prompt, model, timeout_secs);
+    return agent_runner.runWithOptions(allocator, cwd, prompt, model, timeout_secs, agentRunOptionsForDelivery(delivery));
+}
+
+fn agentRunOptionsForDelivery(delivery: DeliveryConfig) agent_runner.AgentRunOptions {
+    return .{
+        .origin_channel = delivery.channel,
+        .origin_account_id = delivery.account_id,
+    };
 }
 
 const LoadPolicy = enum {
@@ -1289,6 +1298,12 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             }
             break :blk null;
         };
+        const delivery_best_effort = blk: {
+            if (obj.get("delivery_best_effort")) |v| {
+                if (v == .bool) break :blk v.bool;
+            }
+            break :blk true;
+        };
         const session_target = blk: {
             if (obj.get("session_target")) |v| {
                 if (v == .string) {
@@ -1329,6 +1344,7 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
                 .to_owned = delivery_to != null,
                 .peer_id_owned = delivery_peer_id != null,
                 .thread_id_owned = delivery_thread_id != null,
+                .best_effort = delivery_best_effort,
             },
         });
     }
@@ -1648,6 +1664,9 @@ fn appendCronJobJson(
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKey(buf, allocator, "delivery_thread_id");
     try appendNullableString(buf, allocator, job.delivery.thread_id);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "delivery_best_effort");
+    try buf.appendSlice(allocator, if (job.delivery.best_effort) "true" else "false");
 
     try buf.appendSlice(allocator, "}");
 }
@@ -1782,13 +1801,87 @@ fn readGatewayUrl(allocator: std.mem.Allocator) ?[]const u8 {
 }
 
 /// Read the paired bearer token from paired_token in the config directory (if present).
+/// Resolves the config dir from NULLCLAW_HOME / $HOME/.nullclaw, then delegates to
+/// readPairedTokenFromDir which transparently decrypts enc2: blobs.
 fn readPairedToken(allocator: std.mem.Allocator) ?[]const u8 {
     const dir = config_paths.defaultConfigDir(allocator) catch return null;
     defer allocator.free(dir);
-    const token_path = config_paths.pathFromConfigDir(allocator, dir, "paired_token") catch return null;
+    return readPairedTokenFromDir(allocator, dir);
+}
+
+/// Read + decrypt the paired token from <config_dir>/paired_token.
+///
+/// Returns null when the file is absent or empty/whitespace. Legacy plaintext
+/// tokens (no `enc2:` prefix) pass through unchanged for backward compatibility.
+/// A tampered or undecryptable blob also returns null (graceful degradation)
+/// rather than propagating the crypto error to the cron caller — the gateway
+/// will simply reject the unauthenticated request as before.
+pub fn readPairedTokenFromDir(allocator: std.mem.Allocator, config_dir: []const u8) ?[]const u8 {
+    const token_path = config_paths.pathFromConfigDir(allocator, config_dir, "paired_token") catch return null;
     defer allocator.free(token_path);
-    const raw = fs_compat.readFileAlloc(std_compat.fs.cwd(), allocator, token_path, 4096) catch return null;
-    return trimOwnedRight(allocator, raw);
+    const file = fs_compat.openPath(token_path, .{
+        .allow_directory = false,
+        .follow_symlinks = false,
+    }) catch |err| {
+        if (err != error.FileNotFound) {
+            log.warn("failed to open paired cron token: {s}", .{@errorName(err)});
+        }
+        return null;
+    };
+    defer file.close();
+    const metadata = file.stat() catch |err| {
+        log.warn("failed to inspect paired cron token: {s}", .{@errorName(err)});
+        return null;
+    };
+    if (metadata.kind != .file) {
+        log.warn("paired cron token is not a regular file", .{});
+        return null;
+    }
+    var raw_buf: [8192]u8 = undefined;
+    if (metadata.size > raw_buf.len) {
+        log.warn("paired cron token exceeds size limit", .{});
+        return null;
+    }
+    // no-follow handles are asynchronous on Windows in Zig 0.16, so they
+    // must be read positionally rather than through readStreaming.
+    const raw_len = file.readAllPositional(&raw_buf) catch |err| {
+        log.warn("failed to read paired cron token: {s}", .{@errorName(err)});
+        return null;
+    };
+    const raw = allocator.dupe(u8, raw_buf[0..raw_len]) catch return null;
+    const trimmed = trimOwnedRight(allocator, raw) orelse return null;
+    // decryptSecret always returns a freshly-allocated buffer: it dupes
+    // plaintext values and dupes the decrypted plaintext for enc2: blobs.
+    const decrypted = secrets.SecretStore.init(config_dir, true)
+        .decryptSecret(allocator, trimmed) catch |err| {
+        allocator.free(trimmed);
+        log.warn("failed to decrypt paired cron token: {s}", .{@errorName(err)});
+        return null;
+    };
+    allocator.free(trimmed);
+    if (decrypted.len == 0) {
+        allocator.free(decrypted);
+        return null;
+    }
+    return decrypted;
+}
+
+/// Persist a cron-scoped bearer to <config_dir>/paired_token. New
+/// credentials are always encrypted; plaintext is accepted only by the reader
+/// for compatibility with operator-managed legacy files.
+pub fn persistPairedToken(
+    allocator: std.mem.Allocator,
+    config_dir: []const u8,
+    token: []const u8,
+) !void {
+    const store = secrets.SecretStore.init(config_dir, true);
+    const blob = try store.encryptSecret(allocator, token);
+    defer allocator.free(blob);
+
+    const token_path = try config_paths.pathFromConfigDir(allocator, config_dir, "paired_token");
+    defer allocator.free(token_path);
+    fs_compat.writeFileAtomicSecure(token_path, blob) catch return error.PairedTokenWriteFailed;
+    log.info("persisted encrypted cron-scoped token", .{});
 }
 
 /// Build Authorization header slice (caller owns via arena/allocator).
@@ -2108,18 +2201,79 @@ pub fn cliStatus(allocator: std.mem.Allocator, as_json: bool) !void {
     }
 }
 
+/// Build the shared `/cron/add` request body used by CLI and tool callers.
+pub fn buildGatewayAddBody(
+    allocator: std.mem.Allocator,
+    expression: ?[]const u8,
+    delay: ?[]const u8,
+    command: ?[]const u8,
+    prompt: ?[]const u8,
+    model: ?[]const u8,
+    delivery: ?DeliveryConfig,
+    session_target: ?SessionTarget,
+) ![]u8 {
+    var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body_buf.deinit(allocator);
+
+    try body_buf.appendSlice(allocator, "{");
+    var wrote_field = false;
+
+    if (expression) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "expression", value);
+    if (delay) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "delay", value);
+    if (command) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "command", value);
+    if (prompt) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "prompt", value);
+    if (model) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "model", value);
+    if (session_target) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "session_target", value.asStr());
+
+    if (delivery) |cfg| {
+        // Keep gateway and local fallback semantics identical even when routing
+        // fields are supplied without --announce.
+        try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "delivery_mode", cfg.mode.asStr());
+        if (cfg.channel) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "delivery_channel", value);
+        if (cfg.account_id) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "delivery_account_id", value);
+        if (cfg.to) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "delivery_to", value);
+        if (cfg.peer_kind) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "delivery_peer_kind", chatTypeAsStr(value));
+        if (cfg.peer_id) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "delivery_peer_id", value);
+        if (cfg.thread_id) |value| try appendGatewayBodyField(&body_buf, allocator, &wrote_field, "delivery_thread_id", value);
+        if (!cfg.best_effort) try appendGatewayBodyLiteral(&body_buf, allocator, &wrote_field, "\"delivery_best_effort\":false");
+    }
+
+    try body_buf.appendSlice(allocator, "}");
+    return try body_buf.toOwnedSlice(allocator);
+}
+
+fn appendGatewayBodyField(
+    body_buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    wrote_field: *bool,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    if (wrote_field.*) try body_buf.appendSlice(allocator, ",");
+    wrote_field.* = true;
+    try json_util.appendJsonKeyValue(body_buf, allocator, key, value);
+}
+
+fn appendGatewayBodyLiteral(
+    body_buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    wrote_field: *bool,
+    literal: []const u8,
+) !void {
+    if (wrote_field.*) try body_buf.appendSlice(allocator, ",");
+    wrote_field.* = true;
+    try body_buf.appendSlice(allocator, literal);
+}
+
 /// CLI: add a recurring cron job.
 pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: []const u8) !void {
     if (readGatewayUrl(allocator)) |url| {
         defer allocator.free(url);
-        var body_buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer body_buf.deinit(allocator);
-        body_buf.appendSlice(allocator, "{") catch {};
-        json_util.appendJsonKeyValue(&body_buf, allocator, "expression", expression) catch {};
-        body_buf.appendSlice(allocator, ",") catch {};
-        json_util.appendJsonKeyValue(&body_buf, allocator, "command", command) catch {};
-        body_buf.appendSlice(allocator, "}") catch {};
-        if (gatewayPost(allocator, url, "/cron/add", body_buf.items)) return;
+        const body = buildGatewayAddBody(allocator, expression, null, command, null, null, null, null) catch null;
+        if (body) |json_body| {
+            defer allocator.free(json_body);
+            if (gatewayPost(allocator, url, "/cron/add", json_body)) return;
+        }
     }
 
     var scheduler = CronScheduler.init(allocator, 1024, true);
@@ -2147,55 +2301,19 @@ pub fn cliAddAgentJob(
     const enriched_delivery = enrichDeliveryRouting(delivery);
     if (readGatewayUrl(allocator)) |url| {
         defer allocator.free(url);
-        // Build JSON body, escaping string values through json_util
-        var body_buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer body_buf.deinit(allocator);
-        body_buf.appendSlice(allocator, "{") catch {};
-        json_util.appendJsonKeyValue(&body_buf, allocator, "expression", expression) catch {};
-        body_buf.appendSlice(allocator, ",") catch {};
-        json_util.appendJsonKeyValue(&body_buf, allocator, "prompt", prompt) catch {};
-        if (model) |m| {
-            body_buf.appendSlice(allocator, ",") catch {};
-            json_util.appendJsonKeyValue(&body_buf, allocator, "model", m) catch {};
-        }
-        if (session_target != .isolated) {
-            body_buf.appendSlice(allocator, ",") catch {};
-            json_util.appendJsonKeyValue(&body_buf, allocator, "session_target", session_target.asStr()) catch {};
-        }
-        if (enriched_delivery.mode != .none) {
-            body_buf.appendSlice(allocator, ",") catch {};
-            json_util.appendJsonKeyValue(&body_buf, allocator, "delivery_mode", enriched_delivery.mode.asStr()) catch {};
-        }
-        if (enriched_delivery.channel) |ch| {
-            body_buf.appendSlice(allocator, ",") catch {};
-            json_util.appendJsonKeyValue(&body_buf, allocator, "delivery_channel", ch) catch {};
-        }
-        if (enriched_delivery.account_id) |account_id| {
-            body_buf.appendSlice(allocator, ",") catch {};
-            json_util.appendJsonKeyValue(&body_buf, allocator, "delivery_account_id", account_id) catch {};
-        }
-        if (enriched_delivery.to) |t| {
-            body_buf.appendSlice(allocator, ",") catch {};
-            json_util.appendJsonKeyValue(&body_buf, allocator, "delivery_to", t) catch {};
-        }
-        if (enriched_delivery.peer_kind) |peer_kind| {
-            body_buf.appendSlice(allocator, ",") catch {};
-            json_util.appendJsonKeyValue(&body_buf, allocator, "delivery_peer_kind", chatTypeAsStr(peer_kind)) catch {};
-        }
-        if (enriched_delivery.peer_id) |peer_id| {
-            body_buf.appendSlice(allocator, ",") catch {};
-            json_util.appendJsonKeyValue(&body_buf, allocator, "delivery_peer_id", peer_id) catch {};
-        }
-        if (enriched_delivery.thread_id) |thread_id| {
-            body_buf.appendSlice(allocator, ",") catch {};
-            json_util.appendJsonKeyValue(&body_buf, allocator, "delivery_thread_id", thread_id) catch {};
-        }
-        if (!enriched_delivery.best_effort) {
-            body_buf.appendSlice(allocator, ",\"delivery_best_effort\":false") catch {};
-        }
-        body_buf.appendSlice(allocator, "}") catch {};
-        if (body_buf.items.len > 2) {
-            if (gatewayPost(allocator, url, "/cron/add", body_buf.items)) return;
+        const body = buildGatewayAddBody(
+            allocator,
+            expression,
+            null,
+            null,
+            prompt,
+            model,
+            enriched_delivery,
+            if (session_target == .isolated) null else session_target,
+        ) catch null;
+        if (body) |json_body| {
+            defer allocator.free(json_body);
+            if (gatewayPost(allocator, url, "/cron/add", json_body)) return;
         }
     }
 
@@ -2217,14 +2335,11 @@ pub fn cliAddAgentJob(
 pub fn cliAddOnce(allocator: std.mem.Allocator, delay: []const u8, command: []const u8) !void {
     if (readGatewayUrl(allocator)) |url| {
         defer allocator.free(url);
-        var body_buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer body_buf.deinit(allocator);
-        body_buf.appendSlice(allocator, "{") catch {};
-        json_util.appendJsonKeyValue(&body_buf, allocator, "delay", delay) catch {};
-        body_buf.appendSlice(allocator, ",") catch {};
-        json_util.appendJsonKeyValue(&body_buf, allocator, "command", command) catch {};
-        body_buf.appendSlice(allocator, "}") catch {};
-        if (gatewayPost(allocator, url, "/cron/add", body_buf.items)) return;
+        const body = buildGatewayAddBody(allocator, null, delay, command, null, null, null, null) catch null;
+        if (body) |json_body| {
+            defer allocator.free(json_body);
+            if (gatewayPost(allocator, url, "/cron/add", json_body)) return;
+        }
     }
 
     var scheduler = CronScheduler.init(allocator, 1024, true);
@@ -2246,33 +2361,32 @@ pub fn cliAddAgentOnce(
     prompt: []const u8,
     model: ?[]const u8,
     session_target: SessionTarget,
+    delivery: DeliveryConfig,
 ) !void {
-    const delivery = DeliveryConfig{};
+    const enriched_delivery = enrichDeliveryRouting(delivery);
     if (readGatewayUrl(allocator)) |url| {
         defer allocator.free(url);
-        var body_buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer body_buf.deinit(allocator);
-        body_buf.appendSlice(allocator, "{") catch {};
-        json_util.appendJsonKeyValue(&body_buf, allocator, "delay", delay) catch {};
-        body_buf.appendSlice(allocator, ",") catch {};
-        json_util.appendJsonKeyValue(&body_buf, allocator, "prompt", prompt) catch {};
-        if (model) |m| {
-            body_buf.appendSlice(allocator, ",") catch {};
-            json_util.appendJsonKeyValue(&body_buf, allocator, "model", m) catch {};
+        const body = buildGatewayAddBody(
+            allocator,
+            null,
+            delay,
+            null,
+            prompt,
+            model,
+            enriched_delivery,
+            if (session_target == .isolated) null else session_target,
+        ) catch null;
+        if (body) |json_body| {
+            defer allocator.free(json_body);
+            if (gatewayPost(allocator, url, "/cron/add", json_body)) return;
         }
-        if (session_target != .isolated) {
-            body_buf.appendSlice(allocator, ",") catch {};
-            json_util.appendJsonKeyValue(&body_buf, allocator, "session_target", session_target.asStr()) catch {};
-        }
-        body_buf.appendSlice(allocator, "}") catch {};
-        if (gatewayPost(allocator, url, "/cron/add", body_buf.items)) return;
     }
 
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
     try loadJobs(&scheduler);
 
-    const job = try scheduler.addAgentOnce(delay, prompt, model, delivery);
+    const job = try scheduler.addAgentOnce(delay, prompt, model, enriched_delivery);
     job.session_target = session_target;
     try saveJobs(&scheduler);
 
@@ -2421,7 +2535,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
             },
             .agent => {
                 const prompt = job.prompt orelse job.command;
-                const result = runAgentJob(allocator, run_cwd, prompt, job.model, scheduler.agent_timeout_secs) catch |err| {
+                const result = runAgentJob(allocator, run_cwd, prompt, job.model, scheduler.agent_timeout_secs, job.delivery) catch |err| {
                     job.last_run_secs = run_at;
                     job.last_status = "error";
                     try saveJobs(&scheduler);
@@ -3035,6 +3149,7 @@ test "save and load roundtrip keeps agent fields" {
         .peer_kind = .group,
         .peer_id = "-100123",
         .thread_id = "77",
+        .best_effort = false,
     });
     recurring.session_target = .main;
     try saveJobs(&scheduler);
@@ -3062,7 +3177,74 @@ test "save and load roundtrip keeps agent fields" {
     try std.testing.expectEqualStrings("-100123", job.delivery.peer_id.?);
     try std.testing.expect(job.delivery.thread_id != null);
     try std.testing.expectEqualStrings("77", job.delivery.thread_id.?);
+    try std.testing.expect(!job.delivery.best_effort);
     try std.testing.expectEqual(SessionTarget.main, job.session_target);
+}
+
+test "cliAddAgentOnce persists delivery routing" {
+    // Regression: once-agent delivery fields must survive CLI storage and reload.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+    const allocator = std.testing.allocator;
+
+    cron_store_test_mutex.lock();
+    defer cron_store_test_mutex.unlock();
+
+    const env_name = try allocator.dupeZ(u8, "NULLCLAW_HOME");
+    defer allocator.free(env_name);
+    const previous_home = std_compat.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer {
+        if (previous_home) |value| {
+            defer allocator.free(value);
+            const value_z = allocator.dupeZ(u8, value) catch unreachable;
+            defer allocator.free(value_z);
+            _ = c.setenv(env_name.ptr, value_z.ptr, 1);
+        } else {
+            _ = c.unsetenv(env_name.ptr);
+        }
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const test_home = try std_compat.fs.path.join(allocator, &.{ base, "nullclaw-home" });
+    defer allocator.free(test_home);
+    const test_home_z = try allocator.dupeZ(u8, test_home);
+    defer allocator.free(test_home_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, test_home_z.ptr, 1));
+
+    try resetCronStoreForTest(allocator);
+    defer resetCronStoreForTest(allocator) catch {};
+
+    try cliAddAgentOnce(allocator, "30s", "Summarize status", "test-model", .isolated, .{
+        .mode = .always,
+        .channel = "telegram",
+        .account_id = "main",
+        .to = "chat-42",
+        .best_effort = false,
+    });
+
+    var loaded = CronScheduler.init(allocator, 10, true);
+    defer loaded.deinit();
+    try loadJobsStrict(&loaded);
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.listJobs().len);
+    const job = loaded.listJobs()[0];
+    try std.testing.expect(job.one_shot);
+    try std.testing.expectEqual(JobType.agent, job.job_type);
+    try std.testing.expectEqualStrings("Summarize status", job.prompt.?);
+    try std.testing.expectEqualStrings("test-model", job.model.?);
+    try std.testing.expectEqual(DeliveryMode.always, job.delivery.mode);
+    try std.testing.expectEqualStrings("telegram", job.delivery.channel.?);
+    try std.testing.expectEqualStrings("main", job.delivery.account_id.?);
+    try std.testing.expectEqualStrings("chat-42", job.delivery.to.?);
+    try std.testing.expect(!job.delivery.best_effort);
 }
 
 test "JobType parse and asStr" {
@@ -3600,6 +3782,74 @@ test "agent job delivers result via bus" {
     try std.testing.expectEqualStrings("Summarize today's news", msg.content);
 }
 
+test "one-shot isolated agent delivery outlives removed job" {
+    // Regression (#941): the outbound queue must not retain freed job delivery routing.
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const job = try scheduler.addAgentOnce("1s", "Summarize status", null, .{
+        .mode = .always,
+        .channel = "telegram",
+        .account_id = "main",
+        .to = "chat-42",
+    });
+    job.next_run_secs = 0;
+
+    _ = scheduler.tick(std_compat.time.timestamp(), &test_bus);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
+
+    var msg = test_bus.consumeOutbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("telegram", msg.channel);
+    try std.testing.expectEqualStrings("main", msg.account_id.?);
+    try std.testing.expectEqualStrings("chat-42", msg.chat_id);
+    try std.testing.expectEqualStrings("Summarize status", msg.content);
+}
+
+test "one-shot main agent delivery outlives removed job" {
+    // Regression (#941): the inbound queue has the same lifetime boundary as outbound delivery.
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const job = try scheduler.addAgentOnce("1s", "Summarize status", null, .{
+        .mode = .always,
+        .channel = "telegram",
+        .account_id = "main",
+        .to = "chat-42",
+    });
+    job.session_target = .main;
+    job.next_run_secs = 0;
+
+    _ = scheduler.tick(std_compat.time.timestamp(), &test_bus);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
+
+    var msg = test_bus.consumeInbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings("telegram", msg.channel);
+    try std.testing.expectEqualStrings("system:cron", msg.sender_id);
+    try std.testing.expectEqualStrings("chat-42", msg.chat_id);
+    try std.testing.expectEqualStrings("telegram:main:chat-42", msg.session_key);
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "Summarize status") != null);
+}
+
+test "agent run options preserve cron delivery attribution" {
+    // Regression: every cron execution path must pass saved origin metadata to the child agent.
+    const options = agentRunOptionsForDelivery(.{
+        .channel = "telegram",
+        .account_id = "main",
+    });
+    try std.testing.expectEqualStrings("telegram", options.origin_channel.?);
+    try std.testing.expectEqualStrings("main", options.origin_account_id.?);
+}
+
 test "DeliveryMode parse and asStr" {
     try std.testing.expectEqual(DeliveryMode.none, DeliveryMode.parse("none"));
     try std.testing.expectEqual(DeliveryMode.always, DeliveryMode.parse("always"));
@@ -3946,4 +4196,121 @@ test "cron rejects obviously malformed expressions" {
         const result = nextRunForCronExpression(input, 0);
         try std.testing.expect(std.meta.isError(result));
     }
+}
+
+// ── paired_token persistence tests (issue #839) ────────────────────
+//
+// Regression: the schedule/cron tool authenticates to the gateway /cron
+// endpoint with a bearer token read from <config_dir>/paired_token, but
+// nothing ever wrote that file — so /cron returned 401 when pairing was
+// required. These tests cover encrypted cron-scoped token persistence.
+
+test "persistPairedToken writes encrypted machine token and round-trips" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const token = "zc_deadbeefcafebabe0000000000000000000000000000000000000000000000ff";
+
+    try persistPairedToken(std.testing.allocator, tmp_path, token);
+
+    // The file on disk must NOT contain the plaintext token.
+    const token_path = try config_paths.pathFromConfigDir(std.testing.allocator, tmp_path, "paired_token");
+    defer std.testing.allocator.free(token_path);
+    const on_disk = try fs_compat.readFileAlloc(std_compat.fs.cwd(), std.testing.allocator, token_path, 8192);
+    defer std.testing.allocator.free(on_disk);
+    try std.testing.expect(std.mem.startsWith(u8, std.mem.trim(u8, on_disk, " \t\r\n"), "enc2:"));
+    try std.testing.expect(std.mem.indexOf(u8, on_disk, token) == null);
+    if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        const token_file = try fs_compat.openPath(token_path, .{ .follow_symlinks = false });
+        defer token_file.close();
+        const metadata = try token_file.stat();
+        try std.testing.expectEqual(@as(std_compat.fs.File.Mode, 0o600), metadata.mode & 0o777);
+    }
+
+    // Reading via the config-dir-aware reader must recover the plaintext token.
+    const read_back = readPairedTokenFromDir(std.testing.allocator, tmp_path) orelse return error.TokenNotRead;
+    defer std.testing.allocator.free(read_back);
+    try std.testing.expectEqualStrings(token, read_back);
+}
+
+test "readPairedTokenFromDir returns null when paired_token absent" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    try std.testing.expect(readPairedTokenFromDir(std.testing.allocator, tmp_path) == null);
+}
+
+test "readPairedTokenFromDir returns null for empty file" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    // Seed an empty (whitespace-only) paired_token — the legacy "nothing here" state.
+    const token_path = try config_paths.pathFromConfigDir(std.testing.allocator, tmp_path, "paired_token");
+    defer std.testing.allocator.free(token_path);
+    try fs_compat.writeFileAtomicSecure(token_path, "   ");
+
+    try std.testing.expect(readPairedTokenFromDir(std.testing.allocator, tmp_path) == null);
+}
+
+test "readPairedTokenFromDir passes legacy plaintext through unchanged" {
+    // Backward compatibility: a pre-existing plaintext paired_token (written by
+    // an older tool or operator) must still be readable without decryption.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const legacy_token = "zc_legacy_plaintext_token_no_enc2_prefix";
+    const token_path = try config_paths.pathFromConfigDir(std.testing.allocator, tmp_path, "paired_token");
+    defer std.testing.allocator.free(token_path);
+    try fs_compat.writeFileAtomicSecure(token_path, legacy_token);
+
+    const read_back = readPairedTokenFromDir(std.testing.allocator, tmp_path) orelse return error.TokenNotRead;
+    defer std.testing.allocator.free(read_back);
+    try std.testing.expectEqualStrings(legacy_token, read_back);
+}
+
+test "readPairedTokenFromDir detects tampered encrypted blob" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    try persistPairedToken(std.testing.allocator, tmp_path, "zc_tamper_test_token_0123456789abcdef0123456789abcdef");
+
+    // Flip a byte in the middle of the enc2: blob.
+    const token_path = try config_paths.pathFromConfigDir(std.testing.allocator, tmp_path, "paired_token");
+    defer std.testing.allocator.free(token_path);
+    const original = try fs_compat.readFileAlloc(std_compat.fs.cwd(), std.testing.allocator, token_path, 8192);
+    defer std.testing.allocator.free(original);
+    var tampered = try std.testing.allocator.dupe(u8, original);
+    defer std.testing.allocator.free(tampered);
+    const flip_at = std.mem.indexOf(u8, tampered, ":").? + 4; // inside hex payload
+    tampered[flip_at] = if (tampered[flip_at] == '0') '1' else '0';
+    try fs_compat.writeFileAtomicSecure(token_path, tampered);
+
+    // Tampered AEAD must fail decryption → reader returns null (graceful, not a crash).
+    try std.testing.expect(readPairedTokenFromDir(std.testing.allocator, tmp_path) == null);
+}
+
+test "readPairedTokenFromDir rejects symlink" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try std_compat.fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    try std_compat.fs.Dir.wrap(tmp_dir.dir).writeFile(.{
+        .sub_path = "outside-token",
+        .data = "zc_symlink_target_must_not_be_read",
+    });
+    try std_compat.fs.Dir.wrap(tmp_dir.dir).symLink("outside-token", "paired_token", .{});
+    try std.testing.expect(readPairedTokenFromDir(std.testing.allocator, tmp_path) == null);
 }

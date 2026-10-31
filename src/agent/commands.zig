@@ -2,7 +2,8 @@ const std = @import("std");
 const std_compat = @import("compat");
 const builtin = @import("builtin");
 const providers = @import("../providers/root.zig");
-const Tool = @import("../tools/root.zig").Tool;
+const tools_root = @import("../tools/root.zig");
+const Tool = tools_root.Tool;
 const skills_mod = @import("../skills.zig");
 const spawn_tool_mod = @import("../tools/spawn.zig");
 const subagent_mod = @import("../subagent.zig");
@@ -480,7 +481,8 @@ fn renderInteractiveModelMenu(self: anytype, provider_name: []const u8, page_num
     defer if (cfg_opt) |*cfg| cfg.deinit();
 
     const api_key = if (cfg_opt) |*cfg| cfg.getProviderKey(provider_name) else null;
-    const models = onboard.fetchModels(self.allocator, provider_name, api_key) catch return null;
+    const base_url = if (cfg_opt) |*cfg| cfg.getProviderBaseUrl(provider_name) else null;
+    const models = onboard.fetchModels(self.allocator, provider_name, api_key, base_url) catch return null;
     defer freeOwnedStringSlice(self.allocator, models);
 
     return renderInteractiveModelMenuFromModels(
@@ -3357,14 +3359,6 @@ fn parseExecAsk(comptime T: type, raw: []const u8) ?T {
     return null;
 }
 
-fn parseQueueMode(comptime T: type, raw: []const u8) ?T {
-    if (std.ascii.eqlIgnoreCase(raw, "off")) return .off;
-    if (std.ascii.eqlIgnoreCase(raw, "serial")) return .serial;
-    if (std.ascii.eqlIgnoreCase(raw, "latest")) return .latest;
-    if (std.ascii.eqlIgnoreCase(raw, "debounce")) return .debounce;
-    return null;
-}
-
 fn parseQueueDrop(comptime T: type, raw: []const u8) ?T {
     if (std.ascii.eqlIgnoreCase(raw, "summarize")) return .summarize;
     if (std.ascii.eqlIgnoreCase(raw, "oldest")) return .oldest;
@@ -3433,7 +3427,7 @@ fn resetRuntimeCommandState(self: anytype) void {
     if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
     self.exec_node_id = null;
     self.exec_node_id_owned = false;
-    self.queue_mode = .serial;
+    self.queue_mode = self.default_queue_mode;
     self.queue_debounce_ms = 0;
     self.queue_cap = 0;
     self.queue_drop = .summarize;
@@ -3655,7 +3649,7 @@ fn handleQueueCommand(self: anytype, arg: []const u8) ![]const u8 {
     }
 
     if (std.ascii.eqlIgnoreCase(arg, "reset")) {
-        self.queue_mode = .serial;
+        self.queue_mode = self.default_queue_mode;
         self.queue_debounce_ms = 0;
         self.queue_cap = 0;
         self.queue_drop = .summarize;
@@ -3664,7 +3658,7 @@ fn handleQueueCommand(self: anytype, arg: []const u8) ![]const u8 {
 
     var it = std.mem.tokenizeAny(u8, arg, " \t");
     while (it.next()) |tok| {
-        if (parseQueueMode(@TypeOf(self.queue_mode), tok)) |mode| {
+        if (@TypeOf(self.queue_mode).fromSlice(tok)) |mode| {
             self.queue_mode = mode;
             continue;
         }
@@ -4060,6 +4054,11 @@ fn runShellCommand(self: anytype, command: []const u8, skip_approval_gate: bool)
             }
         }
     }
+    if (!skip_approval_gate) {
+        if (riskApprovalRequiredMessage(self, command)) |msg| {
+            return try self.allocator.dupe(u8, msg);
+        }
+    }
 
     const shell_tool = findShellTool(self) orelse
         return try self.allocator.dupe(u8, "Shell tool is not enabled.");
@@ -4070,6 +4069,11 @@ fn runShellCommand(self: anytype, command: []const u8, skip_approval_gate: bool)
 
     var args: std.json.ObjectMap = .empty;
     try args.put(arena, "command", .{ .string = command });
+
+    const previous_approved = if (skip_approval_gate) tools_root.setThreadApprovedExecCommand(command) else null;
+    defer {
+        if (skip_approval_gate) _ = tools_root.setThreadApprovedExecCommand(previous_approved);
+    }
 
     const result = shell_tool.execute(arena, args) catch |err| {
         return try std.fmt.allocPrint(self.allocator, "Bash failed: {s}", .{@errorName(err)});
@@ -5284,6 +5288,19 @@ pub fn isExecToolName(tool_name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(tool_name, "shell");
 }
 
+// Gate here, before execute() -- shell.zig always validates approved=false.
+fn riskApprovalRequiredMessage(self: anytype, command: []const u8) ?[]const u8 {
+    if (self.policy) |pol| {
+        _ = pol.validateCommandExecution(command, false) catch |err| {
+            if (err == error.ApprovalRequired) {
+                _ = setPendingExecCommand(self, command) catch {};
+                return "Exec blocked: approval required (medium/high risk). Use /approve allow-once|allow-always|deny";
+            }
+        };
+    }
+    return null;
+}
+
 pub fn execBlockMessage(self: anytype, args: std.json.ObjectMap) ?[]const u8 {
     if (self.exec_host == .node) {
         return "Exec blocked: host=node is not available in this runtime";
@@ -5316,6 +5333,12 @@ pub fn execBlockMessage(self: anytype, args: std.json.ObjectMap) ?[]const u8 {
                     }
                 }
             }
+        }
+    }
+
+    if (args.get("command")) |v| {
+        if (v == .string) {
+            if (riskApprovalRequiredMessage(self, v.string)) |msg| return msg;
         }
     }
 

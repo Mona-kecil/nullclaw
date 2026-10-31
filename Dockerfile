@@ -2,7 +2,7 @@
 
 # ── Stage 1: Build ────────────────────────────────────────────
 # Build natively on the runner architecture and cross-compile per TARGETARCH.
-FROM --platform=$BUILDPLATFORM alpine:3.23 AS builder
+FROM --platform=$BUILDPLATFORM alpine:3.24 AS builder
 
 ARG ZIG_VERSION=0.16.0
 
@@ -73,7 +73,7 @@ EOF
 RUN chown -R 65534:65534 /nullclaw-data
 
 # ── Stage 3: Runtime Base (shared) ────────────────────────────
-FROM alpine:3.23 AS release-base
+FROM alpine:3.24 AS release-base
 
 LABEL org.opencontainers.image.source=https://github.com/nullclaw/nullclaw
 
@@ -81,6 +81,7 @@ RUN apk add --no-cache ca-certificates curl git tzdata
 
 COPY --from=builder /app/zig-out/bin/nullclaw /usr/local/bin/nullclaw
 COPY --from=config /nullclaw-data /nullclaw-data
+RUN chown -R 65534:65534 /nullclaw-data
 
 ENV NULLCLAW_WORKSPACE=/nullclaw-data/workspace
 ENV NULLCLAW_HOME=/nullclaw-data
