@@ -17,7 +17,7 @@ const thread_stacks = @import("thread_stacks.zig");
 // ---------------------------------------------------------------------------
 
 pub const InboundMessage = struct {
-    channel: []const u8, // "telegram", "discord", "webhook", "system"
+    channel: []const u8, // owned channel name: "telegram", "discord", "webhook", "system"
     sender_id: []const u8, // sender identifier
     chat_id: []const u8, // chat/room identifier
     content: []const u8, // message text
@@ -30,7 +30,7 @@ pub const InboundMessage = struct {
         for (self.media) |m| allocator.free(m);
         if (self.media.len > 0) allocator.free(self.media);
         if (self.metadata_json) |md| allocator.free(md);
-        // channel is a string literal or long-lived config pointer — not owned, don't free
+        allocator.free(self.channel);
         allocator.free(self.sender_id);
         allocator.free(self.chat_id);
         allocator.free(self.content);
@@ -39,7 +39,7 @@ pub const InboundMessage = struct {
 };
 
 pub const OutboundMessage = struct {
-    channel: []const u8, // target channel
+    channel: []const u8, // owned target channel
     account_id: ?[]const u8 = null, // target account (multi-account channels)
     chat_id: []const u8, // target chat
     content: []const u8, // response text
@@ -53,7 +53,7 @@ pub const OutboundMessage = struct {
         if (self.media.len > 0) allocator.free(self.media);
         for (self.choices) |choice| choice.deinit(allocator);
         if (self.choices.len > 0) allocator.free(self.choices);
-        // channel is a string literal or long-lived config pointer — not owned, don't free
+        allocator.free(self.channel);
         if (self.account_id) |aid| allocator.free(aid);
         allocator.free(self.chat_id);
         allocator.free(self.content);
@@ -72,7 +72,8 @@ pub fn makeInbound(
     content: []const u8,
     session_key: []const u8,
 ) Allocator.Error!InboundMessage {
-    // channel is not duped — must be a literal or long-lived config pointer
+    const ch = try allocator.dupe(u8, channel);
+    errdefer allocator.free(ch);
     const sid = try allocator.dupe(u8, sender_id);
     errdefer allocator.free(sid);
     const cid = try allocator.dupe(u8, chat_id);
@@ -82,7 +83,7 @@ pub fn makeInbound(
     const sk = try allocator.dupe(u8, session_key);
 
     return .{
-        .channel = channel,
+        .channel = ch,
         .sender_id = sid,
         .chat_id = cid,
         .content = ct,
@@ -101,7 +102,8 @@ pub fn makeInboundFull(
     media_src: []const []const u8,
     metadata_json: ?[]const u8,
 ) Allocator.Error!InboundMessage {
-    // channel is not duped — must be a literal or long-lived config pointer
+    const ch = try allocator.dupe(u8, channel);
+    errdefer allocator.free(ch);
     const sid = try allocator.dupe(u8, sender_id);
     errdefer allocator.free(sid);
     const cid = try allocator.dupe(u8, chat_id);
@@ -135,7 +137,7 @@ pub fn makeInboundFull(
     const md = if (metadata_json) |mj| try allocator.dupe(u8, mj) else null;
 
     return .{
-        .channel = channel,
+        .channel = ch,
         .sender_id = sid,
         .chat_id = cid,
         .content = ct,
@@ -170,13 +172,14 @@ fn makeOutboundWithStage(
     content: []const u8,
     stage: streaming.OutboundStage,
 ) Allocator.Error!OutboundMessage {
-    // channel is not duped — must be a literal or long-lived config pointer
+    const ch = try allocator.dupe(u8, channel);
+    errdefer allocator.free(ch);
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
     const ct = try allocator.dupe(u8, content);
 
     return .{
-        .channel = channel,
+        .channel = ch,
         .chat_id = cid,
         .content = ct,
         .stage = stage,
@@ -211,6 +214,8 @@ fn makeOutboundWithAccountStage(
     content: []const u8,
     stage: streaming.OutboundStage,
 ) Allocator.Error!OutboundMessage {
+    const ch = try allocator.dupe(u8, channel);
+    errdefer allocator.free(ch);
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
     const ct = try allocator.dupe(u8, content);
@@ -218,7 +223,7 @@ fn makeOutboundWithAccountStage(
     const aid = try allocator.dupe(u8, account_id);
 
     return .{
-        .channel = channel,
+        .channel = ch,
         .account_id = aid,
         .chat_id = cid,
         .content = ct,
@@ -248,11 +253,12 @@ fn dupeOutboundChoices(
         allocator.free(duped);
     }
     while (i < normalized.len) : (i += 1) {
-        duped[i] = .{
-            .id = try allocator.dupe(u8, normalized[i].id),
-            .label = try allocator.dupe(u8, normalized[i].label),
-            .submit_text = try allocator.dupe(u8, normalized[i].submit_text),
-        };
+        duped[i] = try outbound.Choice.initOwned(
+            allocator,
+            normalized[i].id,
+            normalized[i].label,
+            normalized[i].submit_text,
+        );
     }
     return duped;
 }
@@ -292,6 +298,8 @@ pub fn makeOutboundWithChoices(
     content: []const u8,
     choices_src: anytype,
 ) Allocator.Error!OutboundMessage {
+    const ch = try allocator.dupe(u8, channel);
+    errdefer allocator.free(ch);
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
     const ct = try allocator.dupe(u8, content);
@@ -303,7 +311,7 @@ pub fn makeOutboundWithChoices(
     };
 
     return .{
-        .channel = channel,
+        .channel = ch,
         .chat_id = cid,
         .content = ct,
         .choices = choices,
@@ -318,6 +326,8 @@ pub fn makeOutboundWithAccountChoices(
     content: []const u8,
     choices_src: anytype,
 ) Allocator.Error!OutboundMessage {
+    const ch = try allocator.dupe(u8, channel);
+    errdefer allocator.free(ch);
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
     const ct = try allocator.dupe(u8, content);
@@ -331,7 +341,7 @@ pub fn makeOutboundWithAccountChoices(
     };
 
     return .{
-        .channel = channel,
+        .channel = ch,
         .account_id = aid,
         .chat_id = cid,
         .content = ct,
@@ -347,7 +357,8 @@ fn makeOutboundWithMedia(
     content: []const u8,
     media_src: []const []const u8,
 ) Allocator.Error!OutboundMessage {
-    // channel is not duped — must be a literal or long-lived config pointer
+    const ch = try allocator.dupe(u8, channel);
+    errdefer allocator.free(ch);
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
     const ct = try allocator.dupe(u8, content);
@@ -367,7 +378,7 @@ fn makeOutboundWithMedia(
     } else &[_][]const u8{};
 
     return .{
-        .channel = channel,
+        .channel = ch,
         .chat_id = cid,
         .content = ct,
         .media = media,
@@ -580,15 +591,18 @@ test "OutboundMessage.deinit frees all fields" {
     msg.deinit(alloc);
 }
 
-test "makeInbound produces owned copies of non-channel fields" {
+test "makeInbound produces owned copies" {
     const alloc = testing.allocator;
+    var src_channel = try alloc.dupe(u8, "webhook");
+    defer alloc.free(src_channel);
     var src_content = try alloc.dupe(u8, "body");
     defer alloc.free(src_content);
 
-    const msg = try makeInbound(alloc, "webhook", "s", "c", src_content, "webhook:c");
+    const msg = try makeInbound(alloc, src_channel, "s", "c", src_content, "webhook:c");
     defer msg.deinit(alloc);
 
-    // Mutate source — message must be unaffected (channel is borrowed, not duped)
+    // Regression (#941): queued messages must outlive a one-shot cron job's routing storage.
+    src_channel[0] = 'X';
     src_content[0] = 'X';
     try testing.expectEqualStrings("body", msg.content);
     try testing.expectEqualStrings("webhook", msg.channel);
@@ -596,13 +610,18 @@ test "makeInbound produces owned copies of non-channel fields" {
 
 test "makeOutbound produces owned copies" {
     const alloc = testing.allocator;
+    var src_channel = try alloc.dupe(u8, "telegram");
+    defer alloc.free(src_channel);
     var src_content = try alloc.dupe(u8, "reply");
     defer alloc.free(src_content);
 
-    const msg = try makeOutbound(alloc, "telegram", "c1", src_content);
+    const msg = try makeOutbound(alloc, src_channel, "c1", src_content);
     defer msg.deinit(alloc);
 
+    // Regression (#941): queued messages must not borrow freed delivery routing.
+    src_channel[0] = 'X';
     src_content[0] = 'Z';
+    try testing.expectEqualStrings("telegram", msg.channel);
     try testing.expectEqualStrings("reply", msg.content);
     try testing.expect(msg.stage == .final);
     try testing.expectEqual(@as(u64, 0), msg.draft_id);

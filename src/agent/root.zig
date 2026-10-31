@@ -179,21 +179,7 @@ pub const Agent = struct {
         }
     };
 
-    pub const QueueMode = enum {
-        off,
-        serial,
-        latest,
-        debounce,
-
-        pub fn toSlice(self: QueueMode) []const u8 {
-            return switch (self) {
-                .off => "off",
-                .serial => "serial",
-                .latest => "latest",
-                .debounce => "debounce",
-            };
-        }
-    };
+    pub const QueueMode = config_types.QueueMode;
 
     const QueueDrop = enum {
         summarize,
@@ -312,6 +298,7 @@ pub const Agent = struct {
     max_tool_iterations: u32,
     max_history_messages: u32,
     auto_save: bool,
+    compact_context: bool = true,
     token_limit: u64 = 0,
     token_limit_override: ?u64 = null,
     max_tokens: u32 = max_tokens_resolver.DEFAULT_MODEL_MAX_TOKENS,
@@ -327,6 +314,7 @@ pub const Agent = struct {
     exec_ask: ExecAsk = .on_miss,
     exec_node_id: ?[]const u8 = null,
     exec_node_id_owned: bool = false,
+    default_queue_mode: QueueMode = .serial,
     queue_mode: QueueMode = .serial,
     queue_debounce_ms: u32 = 0,
     queue_cap: u32 = 0,
@@ -630,6 +618,7 @@ pub const Agent = struct {
             .max_tool_iterations = cfg.agent.max_tool_iterations,
             .max_history_messages = cfg.agent.max_history_messages,
             .auto_save = cfg.memory.auto_save,
+            .compact_context = cfg.agent.compact_context,
             .token_limit = resolved_token_limit,
             .token_limit_override = token_limit_override,
             .max_tokens = resolved_max_tokens,
@@ -642,6 +631,8 @@ pub const Agent = struct {
             .compaction_keep_recent = cfg.agent.compaction_keep_recent,
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
+            .default_queue_mode = cfg.agent.default_queue_mode,
+            .queue_mode = cfg.agent.default_queue_mode,
             .tools_config = cfg.tools,
             .tool_filter_groups = cfg.agent.tool_filter_groups,
             .default_exec_security = resolved_exec_security,
@@ -869,6 +860,15 @@ pub const Agent = struct {
         const completion_budget_u32: u32 = @intCast(@min(completion_budget, @as(u64, std.math.maxInt(u32))));
         if (completion_budget_u32 == 0) return 1;
         return @max(@as(u32, 1), @min(max_tokens, completion_budget_u32));
+    }
+
+    /// Proactively auto-compact history, honoring `agent.compact_context`.
+    /// When the flag is disabled the LLM summarization pass is skipped. Hard
+    /// history trimming and emergency `forceCompressHistory` remain separate
+    /// safeguards and are intentionally not gated by this flag.
+    pub fn maybeAutoCompactHistory(self: *Agent) bool {
+        if (!self.compact_context) return false;
+        return self.autoCompactHistory() catch false;
     }
 
     /// Auto-compact history when it exceeds thresholds.
@@ -1843,6 +1843,37 @@ pub const Agent = struct {
         return prioritized;
     }
 
+    /// Build a subset of `self.tools` suitable for the text-based system prompt.
+    /// Only includes built-in tools and MCP tools from `always` filter groups.
+    /// Dynamic-group MCP tools are omitted — their schemas are still available
+    /// via native API tool-calling when the turn keywords match.
+    fn filterToolsForPromptText(self: *const Agent, arena: std.mem.Allocator) ![]const Tool {
+        if (self.tool_filter_groups.len == 0) return self.tools;
+
+        var result: std.ArrayListUnmanaged(Tool) = .empty;
+        errdefer result.deinit(arena);
+
+        for (self.tools) |t| {
+            if (!std.mem.startsWith(u8, t.name(), "mcp_")) {
+                try result.append(arena, t);
+                continue;
+            }
+
+            for (self.tool_filter_groups) |group| {
+                if (group.mode != .always) continue;
+                for (group.tools) |pattern| {
+                    if (globMatch(pattern, t.name())) {
+                        try result.append(arena, t);
+                        break;
+                    }
+                } else continue;
+                break;
+            }
+        }
+
+        return try result.toOwnedSlice(arena);
+    }
+
     /// Filter and prioritize `self.tool_specs` for the current turn.
     ///
     /// Returns a slice allocated from `arena` containing only the specs that should
@@ -1980,17 +2011,23 @@ pub const Agent = struct {
                 self.system_prompt_conversation_context_fingerprint != turn_conversation_context_fingerprint);
 
         if (!self.has_system_prompt or conversation_context_changed) {
+            var prompt_tools_arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer prompt_tools_arena.deinit();
+            const prompt_tools = try self.filterToolsForPromptText(prompt_tools_arena.allocator());
+            const prompt_is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
+            const prompt_native_tools_enabled = !prompt_is_streaming and self.provider.supportsNativeTools();
+
             const capabilities_section = capabilities_mod.buildPromptSection(
                 self.allocator,
                 cfg_for_prompt_ptr,
-                self.tools,
+                prompt_tools,
             ) catch null;
             defer if (capabilities_section) |section| self.allocator.free(section);
 
             const full_system = try prompt.buildSystemPrompt(self.allocator, .{
                 .workspace_dir = self.workspace_dir,
                 .model_name = turn_model_name,
-                .tools = self.tools,
+                .tools = prompt_tools,
                 .timezone = if (cfg_for_prompt_ptr) |cfg_ptr| cfg_ptr.agent.timezone else "UTC",
                 .capabilities_section = capabilities_section,
                 .conversation_context = self.conversation_context,
@@ -1998,6 +2035,7 @@ pub const Agent = struct {
                 .identity_config = if (cfg_for_prompt_ptr) |cfg| cfg.identity else null,
                 .operator_identity = if (cfg_for_prompt_ptr) |cfg| cfg.operator_identity else .{},
                 .observer = self.observer,
+                .native_tools_enabled = prompt_native_tools_enabled,
             });
             const active_skill_section = try commands.buildActiveSkillPromptSection(self);
             defer if (active_skill_section) |section| self.allocator.free(section);
@@ -2585,8 +2623,8 @@ pub const Agent = struct {
                     .content = try self.dupeForHistory(display_text),
                 });
 
-                // Auto-compaction before hard trimming to preserve context
-                self.last_turn_compacted = self.autoCompactHistory() catch false;
+                // Auto-compaction before hard trimming to preserve context.
+                self.last_turn_compacted = self.maybeAutoCompactHistory();
                 self.trimHistory();
 
                 // Auto-save assistant response
@@ -2653,7 +2691,7 @@ pub const Agent = struct {
             // so avoid writing arbitrary text that can corrupt the control channel.
             if (!builtin.is_test and display_text.len > 0 and parsed_calls.len > 0 and !is_streaming) {
                 var out_buf: [4096]u8 = undefined;
-                var bw = std_compat.fs.File.stdout().writer(&out_buf);
+                var bw = std_compat.fs.File.stdout().writerStreaming(&out_buf);
                 const w = &bw.interface;
                 w.print("{s}", .{display_text}) catch {};
                 w.flush() catch {};
@@ -2878,7 +2916,7 @@ pub const Agent = struct {
         });
 
         // Compact/trim history so the next turn doesn't start with bloated context
-        self.last_turn_compacted = self.autoCompactHistory() catch false;
+        self.last_turn_compacted = self.maybeAutoCompactHistory();
         self.trimHistory();
 
         const complete_event = ObserverEvent{ .turn_complete = {} };
@@ -4009,6 +4047,106 @@ test "compaction module reexport" {
     _ = compaction.forceCompressHistory;
     _ = compaction.trimHistory;
     _ = compaction.CompactionConfig;
+}
+
+// Minimal provider that returns a fixed summary and counts invocations,
+// used to observe whether maybeAutoCompactHistory reached the summarizer.
+const CompactionTestProvider = struct {
+    calls: usize = 0,
+
+    fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+        return allocator.dupe(u8, "");
+    }
+    fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+        const self: *CompactionTestProvider = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        return .{ .content = try allocator.dupe(u8, "auto summary") };
+    }
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+    fn getName(_: *anyopaque) []const u8 {
+        return "compaction-test-provider";
+    }
+    fn deinit(_: *anyopaque) void {}
+
+    const vtable = Provider.VTable{
+        .chatWithSystem = chatWithSystem,
+        .chat = chat,
+        .supportsNativeTools = supportsNativeTools,
+        .getName = getName,
+        .deinit = deinit,
+    };
+};
+
+fn makeCompactionTestAgent(allocator: std.mem.Allocator, observer: anytype, provider: Provider, compact_context: bool) Agent {
+    return Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = &.{},
+        .mem = null,
+        .observer = observer,
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 4,
+        .auto_save = false,
+        .compact_context = compact_context,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+        .token_limit = 0,
+    };
+}
+
+fn fillOverThreshold(allocator: std.mem.Allocator, agent: *Agent) !void {
+    try agent.history.append(allocator, .{ .role = .system, .content = try allocator.dupe(u8, "system prompt") });
+    for (0..12) |i| {
+        try agent.history.append(allocator, .{ .role = .user, .content = try std.fmt.allocPrint(allocator, "message {d}", .{i}) });
+        try agent.history.append(allocator, .{ .role = .assistant, .content = try std.fmt.allocPrint(allocator, "reply {d}", .{i}) });
+    }
+}
+
+test "maybeAutoCompactHistory skips compaction when compact_context is false (regression #937)" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var provider_state = CompactionTestProvider{};
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &CompactionTestProvider.vtable };
+
+    var agent = makeCompactionTestAgent(allocator, noop.observer(), provider, false);
+    defer agent.deinit();
+    try fillOverThreshold(allocator, &agent);
+
+    const len_before = agent.history.items.len;
+    const compacted = agent.maybeAutoCompactHistory();
+
+    // Flag is off: history is left untouched and the summarizer is never called,
+    // even though the message count is well over max_history_messages.
+    try std.testing.expect(!compacted);
+    try std.testing.expectEqual(len_before, agent.history.items.len);
+    try std.testing.expectEqual(@as(usize, 0), provider_state.calls);
+}
+
+test "maybeAutoCompactHistory compacts when compact_context is true" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var provider_state = CompactionTestProvider{};
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &CompactionTestProvider.vtable };
+
+    var agent = makeCompactionTestAgent(allocator, noop.observer(), provider, true);
+    defer agent.deinit();
+    try fillOverThreshold(allocator, &agent);
+
+    const len_before = agent.history.items.len;
+    const compacted = agent.maybeAutoCompactHistory();
+
+    // Flag is on: the same over-threshold history is compacted and the
+    // summarizer is invoked, shrinking the message count.
+    try std.testing.expect(compacted);
+    try std.testing.expect(agent.history.items.len < len_before);
+    try std.testing.expect(provider_state.calls > 0);
 }
 
 test "cli module reexport" {
@@ -5183,6 +5321,45 @@ test "Agent.fromConfig applies status_show_emojis flag" {
     defer agent.deinit();
 
     try std.testing.expect(!agent.status_show_emojis);
+}
+
+test "Agent.fromConfig applies compact_context flag" {
+    // Regression: #937. Parsed `agent.compact_context = false` must reach the
+    // runtime Agent so proactive compaction can be skipped.
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.agent.compact_context = false;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expect(!agent.compact_context);
+    try std.testing.expect(!agent.maybeAutoCompactHistory());
+}
+
+test "Agent.fromConfig applies default_queue_mode" {
+    // Regression: parsing the default is insufficient unless both runtime fields receive it.
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.agent.default_queue_mode = .latest;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expectEqual(Agent.QueueMode.latest, agent.default_queue_mode);
+    try std.testing.expectEqual(Agent.QueueMode.latest, agent.queue_mode);
 }
 
 test "slash /new clears history" {
@@ -6564,6 +6741,23 @@ test "slash queue reset and restart restore serial default while off remains exp
     }
 }
 
+test "slash /queue reset restores configured default" {
+    // Regression: reset must not hardcode off after a non-off config default.
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.default_queue_mode = .latest;
+    agent.queue_mode = .serial;
+
+    const response = (try agent.handleSlashCommand("/queue reset")).?;
+    defer allocator.free(response);
+
+    try std.testing.expectEqual(Agent.QueueMode.latest, agent.queue_mode);
+    try std.testing.expectEqual(@as(u32, 0), agent.queue_debounce_ms);
+    try std.testing.expectEqual(@as(u32, 0), agent.queue_cap);
+    try std.testing.expect(agent.queue_drop == .summarize);
+}
+
 test "slash /usage updates usage mode" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
@@ -6822,6 +7016,95 @@ test "slash /approve executes pending bash command" {
     try std.testing.expect(agent.pending_exec_command == null);
 }
 
+// Regression for #900: a medium/high-risk command in supervised mode must
+// pause for /approve, not fail outright -- whether reached via the LLM's
+// automatic tool call (execBlockMessage) or /bash (runShellCommand).
+test "execBlockMessage requires approval for medium-risk command in supervised mode" {
+    const allocator = std.testing.allocator;
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(allocator, 100);
+    defer tracker.deinit();
+
+    const allowed = [_][]const u8{"touch"};
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .supervised,
+        .require_approval_for_medium_risk = true,
+        .block_medium_risk_commands = false,
+        .workspace_dir = "/tmp",
+        .tracker = &tracker,
+        .allowed_commands = &allowed,
+    };
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.policy = &policy;
+
+    var args: std.json.ObjectMap = .empty;
+    defer args.deinit(allocator);
+    try args.put(allocator, "command", .{ .string = "touch test.txt" });
+
+    const msg = agent.execBlockMessage(args) orelse
+        return error.TestExpectedApprovalMessage;
+    try std.testing.expect(std.mem.indexOf(u8, msg, "approval required") != null);
+    try std.testing.expect(agent.pending_exec_command != null);
+    try std.testing.expectEqualStrings("touch test.txt", agent.pending_exec_command.?);
+}
+
+test "slash /approve re-runs a medium-risk bash command instead of re-blocking it" {
+    const allocator = std.testing.allocator;
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(allocator, 100);
+    defer tracker.deinit();
+
+    const allowed = [_][]const u8{"touch"};
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .supervised,
+        .require_approval_for_medium_risk = true,
+        .block_medium_risk_commands = false,
+        .workspace_dir = ".",
+        .tracker = &tracker,
+        .allowed_commands = &allowed,
+    };
+
+    const shell_impl = try allocator.create(tools_mod.shell.ShellTool);
+    shell_impl.* = .{ .workspace_dir = ".", .policy = &policy };
+    const shell_tool = shell_impl.tool();
+    defer shell_tool.deinit(allocator);
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{shell_tool},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = ".",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .policy = &policy,
+    };
+    defer agent.deinit();
+
+    const pending_resp = (try agent.handleSlashCommand("/bash touch nullclaw-900-test.txt")).?;
+    defer allocator.free(pending_resp);
+    try std.testing.expect(std.mem.indexOf(u8, pending_resp, "approval required") != null);
+    try std.testing.expect(agent.pending_exec_command != null);
+
+    const approve_resp = (try agent.handleSlashCommand("/approve allow-once")).?;
+    defer allocator.free(approve_resp);
+    // Before the fix this stayed "Command requires approval" forever, since
+    // shell.zig always validated with approved=false.
+    try std.testing.expect(std.mem.indexOf(u8, approve_resp, "approval required") == null);
+    try std.testing.expect(agent.pending_exec_command == null);
+
+    std_compat.fs.cwd().deleteFile("nullclaw-900-test.txt") catch {};
+}
+
 test "slash /restart clears runtime command settings" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
@@ -6835,6 +7118,8 @@ test "slash /restart clears runtime command settings" {
     defer allocator.free(usage_resp);
     const tts_resp = (try agent.handleSlashCommand("/tts always provider test-provider")).?;
     defer allocator.free(tts_resp);
+    agent.default_queue_mode = .latest;
+    agent.queue_mode = .serial;
     agent.total_tokens = 42;
     agent.last_turn_usage = .{ .prompt_tokens = 7, .completion_tokens = 5, .total_tokens = 12 };
 
@@ -6847,6 +7132,8 @@ test "slash /restart clears runtime command settings" {
     try std.testing.expect(agent.usage_mode == .off);
     try std.testing.expect(agent.tts_mode == .off);
     try std.testing.expect(agent.tts_provider == null);
+    // Regression: /restart clears overrides but keeps the configured queue default.
+    try std.testing.expectEqual(Agent.QueueMode.latest, agent.queue_mode);
     try std.testing.expectEqual(@as(u64, 0), agent.total_tokens);
     try std.testing.expectEqual(@as(u32, 0), agent.last_turn_usage.total_tokens);
 }
@@ -10530,6 +10817,250 @@ test "priorityToolForSpecsMessage ignores tools excluded from turn specs" {
     try std.testing.expectEqualStrings("shell", turn_specs[0].name);
     try std.testing.expect(agent.priorityToolForSpecsMessage(turn_specs, "private") == null);
     agent.tool_specs = try allocator.alloc(ToolSpec, 0);
+}
+
+// ── filterToolsForPromptText tests ─────────────────────────────────
+
+const MockFilterTool = struct {
+    name_buf: []const u8,
+    desc_buf: []const u8,
+};
+
+fn mockFilterToolVTable() tools_mod.Tool.VTable {
+    return .{
+        .name = struct {
+            fn f(ptr: *anyopaque) []const u8 {
+                return @as(*const MockFilterTool, @ptrCast(@alignCast(ptr))).name_buf;
+            }
+        }.f,
+        .description = struct {
+            fn f(ptr: *anyopaque) []const u8 {
+                return @as(*const MockFilterTool, @ptrCast(@alignCast(ptr))).desc_buf;
+            }
+        }.f,
+        .parameters_json = struct {
+            fn f(_: *anyopaque) []const u8 {
+                return "{}";
+            }
+        }.f,
+        .execute = struct {
+            fn f(_: *anyopaque, _: std.mem.Allocator, _: tools_mod.JsonObjectMap) anyerror!tools_mod.ToolResult {
+                return tools_mod.ToolResult.ok("");
+            }
+        }.f,
+    };
+}
+
+fn makeMockFilterTool(allocator: std.mem.Allocator, name: []const u8) !Tool {
+    const m = try allocator.create(MockFilterTool);
+    m.* = .{ .name_buf = try allocator.dupe(u8, name), .desc_buf = try allocator.dupe(u8, name) };
+    const vt = try allocator.create(tools_mod.Tool.VTable);
+    vt.* = mockFilterToolVTable();
+    return .{ .ptr = @ptrCast(m), .vtable = vt };
+}
+
+fn freeMockFilterTool(tool: Tool, allocator: std.mem.Allocator) void {
+    const m: *MockFilterTool = @ptrCast(@alignCast(tool.ptr));
+    allocator.free(m.name_buf);
+    allocator.free(m.desc_buf);
+    allocator.destroy(m);
+    allocator.destroy(@constCast(tool.vtable));
+}
+
+test "filterToolsForPromptText no groups returns all tools" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    allocator.free(agent.tools);
+
+    agent.tools = &.{
+        try makeMockFilterTool(allocator, "shell"),
+        try makeMockFilterTool(allocator, "mcp_webdav_read"),
+    };
+    defer for (agent.tools) |t| freeMockFilterTool(t, allocator);
+
+    const result = try agent.filterToolsForPromptText(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+}
+
+test "filterToolsForPromptText always group includes matching MCP" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    allocator.free(agent.tools);
+
+    agent.tools = &.{
+        try makeMockFilterTool(allocator, "shell"),
+        try makeMockFilterTool(allocator, "mcp_webdav_read"),
+        try makeMockFilterTool(allocator, "mcp_browser_open"),
+    };
+    defer for (agent.tools) |t| freeMockFilterTool(t, allocator);
+    agent.tool_filter_groups = &.{
+        .{ .mode = .always, .tools = &.{"mcp_webdav_*"} },
+    };
+
+    const result = try agent.filterToolsForPromptText(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+}
+
+test "filterToolsForPromptText dynamic group excluded from text" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    allocator.free(agent.tools);
+
+    agent.tools = &.{
+        try makeMockFilterTool(allocator, "shell"),
+        try makeMockFilterTool(allocator, "mcp_vikunja_create_task"),
+        try makeMockFilterTool(allocator, "mcp_webdav_read"),
+    };
+    defer for (agent.tools) |t| freeMockFilterTool(t, allocator);
+    agent.tool_filter_groups = &.{
+        .{ .mode = .dynamic, .tools = &.{"mcp_vikunja_*"}, .keywords = &.{"task"} },
+        .{ .mode = .always, .tools = &.{"mcp_webdav_*"} },
+    };
+
+    const result = try agent.filterToolsForPromptText(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqualStrings("shell", result[0].name());
+}
+
+test "filterToolsForPromptText empty group excludes MCP tools" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    allocator.free(agent.tools);
+
+    agent.tools = &.{
+        try makeMockFilterTool(allocator, "shell"),
+        try makeMockFilterTool(allocator, "mcp_webdav_read"),
+    };
+    defer for (agent.tools) |t| freeMockFilterTool(t, allocator);
+    agent.tool_filter_groups = &.{
+        .{ .mode = .always, .tools = &.{} },
+    };
+
+    const result = try agent.filterToolsForPromptText(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    try std.testing.expectEqualStrings("shell", result[0].name());
+}
+
+test "Agent system prompt keeps parameters when streaming disables native tool schemas" {
+    // Regression: streaming turns send tools=null, so the text prompt must keep
+    // Parameters even if the provider supports native tools.
+    const StreamingPromptCapture = struct {
+        captured_system: ?[]u8 = null,
+        capture_alloc: std.mem.Allocator,
+
+        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator_.dupe(u8, "ok");
+        }
+
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return error.ShouldNotUseBlockingChat;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            allocator_: std.mem.Allocator,
+            request: providers.ChatRequest,
+            model: []const u8,
+            _: f64,
+            callback: providers.StreamCallback,
+            callback_ctx: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            try std.testing.expect(request.tools == null);
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            for (request.messages) |msg| {
+                if (msg.role == .system) {
+                    if (self.captured_system) |old| self.capture_alloc.free(old);
+                    self.captured_system = try self.capture_alloc.dupe(u8, msg.content);
+                    break;
+                }
+            }
+            callback(callback_ctx, providers.StreamChunk.textDelta("ok"));
+            callback(callback_ctx, providers.StreamChunk.finalChunk());
+            return .{
+                .content = try allocator_.dupe(u8, "ok"),
+                .model = try allocator_.dupe(u8, model),
+            };
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "streaming-prompt-capture";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = StreamingPromptCapture{ .capture_alloc = allocator };
+    defer if (provider_state.captured_system) |captured| allocator.free(captured);
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = StreamingPromptCapture.chatWithSystem,
+        .chat = StreamingPromptCapture.chat,
+        .supportsNativeTools = StreamingPromptCapture.supportsNativeTools,
+        .getName = StreamingPromptCapture.getName,
+        .deinit = StreamingPromptCapture.deinitFn,
+        .supports_streaming = StreamingPromptCapture.supportsStreaming,
+        .stream_chat = StreamingPromptCapture.streamChat,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    const runtime_tools = [_]Tool{
+        try makeMockFilterTool(allocator, "shell"),
+        try makeMockFilterTool(allocator, "mcp_secret_lookup"),
+    };
+    defer for (runtime_tools) |t| freeMockFilterTool(t, allocator);
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, provider, &runtime_tools, null, noop.observer());
+    defer agent.deinit();
+    agent.tool_filter_groups = &.{
+        .{ .mode = .dynamic, .tools = &.{"mcp_secret_*"}, .keywords = &.{"secret"} },
+    };
+
+    const StreamSink = struct {
+        fn onChunk(_: *anyopaque, _: providers.StreamChunk) void {}
+    };
+    var stream_ctx: u8 = 0;
+    agent.stream_callback = StreamSink.onChunk;
+    agent.stream_ctx = @ptrCast(&stream_ctx);
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expect(provider_state.captured_system != null);
+    const captured = provider_state.captured_system.?;
+    try std.testing.expect(std.mem.indexOf(u8, captured, "**shell**: shell") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured, "Parameters: `{}`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured, "mcp_secret_lookup") == null);
 }
 
 test "buildProviderMessagesForTurn adds priority hint without mutating history" {

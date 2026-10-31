@@ -753,6 +753,15 @@ fn handleTelegramInteractiveCallback(
     is_group: bool,
     message_sender_id: []const u8,
 ) bool {
+    // Mirror processTelegramMessage: keep callback-query processing visible
+    // during slow model calls from interactive Telegram buttons.
+    const typing_target = sender;
+    const draft_turn_id = tg_ptr.startTypingTurn(typing_target) catch 0;
+    defer {
+        tg_ptr.stopTyping(typing_target) catch {};
+        if (draft_turn_id != 0) tg_ptr.finishDraftTurn(typing_target, draft_turn_id) catch {};
+    }
+
     const conversation_context = telegramConversationContext(tg_ptr.account_id, sender, is_group, message_sender_id);
 
     var response_owned = false;
@@ -2292,10 +2301,23 @@ pub fn runMatrixLoop(
 ) void {
     loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
+    const state_dir: ?[]u8 = matrix.MatrixChannel.stateDirFromConfigPath(allocator, config.config_path) catch |err| blk: {
+        log.warn("Matrix cursor persistence disabled: {}", .{err});
+        break :blk null;
+    };
+    defer if (state_dir) |dir| allocator.free(dir);
+    if (state_dir) |dir| mx_ptr.loadPersistedNextBatch(dir);
+
     var evict_counter: u32 = 0;
 
     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
         const messages = mx_ptr.pollMessages(allocator) catch |err| {
+            if (err == error.MatrixSyncPositionExpired) {
+                if (state_dir) |dir| mx_ptr.discardPersistedNextBatch(dir);
+                log.warn("Matrix sync position expired; restarting from a fresh snapshot", .{});
+                loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+                continue;
+            }
             log.warn("Matrix poll error: {}", .{err});
             loop_state.last_activity.store(std_compat.time.timestamp(), .release);
             std_compat.thread.sleep(5 * std.time.ns_per_s);
@@ -2376,6 +2398,11 @@ pub fn runMatrixLoop(
             }
             allocator.free(messages);
         }
+
+        // Regression: committing during parse can skip unprocessed events if
+        // the process exits between receiving and dispatching a /sync batch.
+        // Commit only after every message in the batch has been handled.
+        if (state_dir) |dir| mx_ptr.commitNextBatch(dir);
 
         evict_counter += 1;
         if (evict_counter >= 100) {
@@ -3022,6 +3049,66 @@ test "telegramConversationContext keeps delivery target for callback-driven topi
     try std.testing.expectEqualStrings("-100123#topic:77", context.peer_id.?);
     try std.testing.expectEqualStrings("-100123#topic:77", context.group_id.?);
     try std.testing.expect(context.is_group.?);
+}
+
+test "telegram callback starts typing turn and cleans up on local slash miss" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+    const config_path = try std_compat.fs.path.join(allocator, &.{ workspace, "config.json" });
+    defer allocator.free(config_path);
+
+    var allowed_paths = [_][]const u8{workspace};
+    const cfg = Config{
+        .workspace_dir = workspace,
+        .config_path = config_path,
+        .allocator = allocator,
+        .default_model = "test/mock-model",
+        .memory = .{
+            .profile = "minimal_none",
+            .backend = "none",
+            .auto_save = false,
+        },
+        .security = .{
+            .sandbox = .{
+                .enabled = false,
+                .backend = .none,
+            },
+        },
+        .autonomy = .{
+            .allowed_paths = &allowed_paths,
+        },
+    };
+
+    var runtime = try ChannelRuntime.init(allocator, &cfg);
+    defer runtime.deinit();
+
+    var tg = telegram.TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer tg.channel().stop();
+    const before_draft_counter = tg.draft_id_counter.load(.monotonic);
+
+    // Regression: callback-query paths should mirror normal Telegram messages
+    // and start a typing/draft turn even when the callback returns locally.
+    const handled = handleTelegramInteractiveCallback(
+        allocator,
+        runtime,
+        &tg,
+        "telegram:default:direct:12345",
+        "/not-a-local-command",
+        "12345",
+        77,
+        false,
+        "user_a",
+    );
+
+    try std.testing.expect(!handled);
+    try std.testing.expectEqual(before_draft_counter + 1, tg.draft_id_counter.load(.monotonic));
+    try std.testing.expect(tg.typing_handles.get("12345") == null);
+    try std.testing.expect(tg.draft_buffers.get("12345") == null);
 }
 
 test "defaultAgentErrorMessage distinguishes timeout from generic network errors" {
