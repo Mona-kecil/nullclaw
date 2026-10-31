@@ -345,6 +345,15 @@ pub const ChatRequest = struct {
     include_reasoning: ?bool = null,
 };
 
+/// Preserve the simple provider path unless an explicit effort is requested.
+pub fn chatWithSystemEffort(provider: Provider, allocator: std.mem.Allocator, system_prompt: ?[]const u8, message: []const u8, model: []const u8, temperature: f64, effort: ?[]const u8) ![]const u8 {
+    const selected_effort = effort orelse return provider.chatWithSystem(allocator, system_prompt, message, model, temperature);
+    const messages = [_]ChatMessage{ ChatMessage.system(system_prompt orelse "You are a helpful assistant."), ChatMessage.user(message) };
+    var response = try provider.chat(allocator, .{ .messages = &messages, .reasoning_effort = selected_effort }, model, temperature);
+    defer response.deinit(allocator);
+    return allocator.dupe(u8, response.contentOrEmpty());
+}
+
 /// A single tool result message in a conversation.
 pub const ToolResultMessage = struct {
     tool_call_id: []const u8,
@@ -1014,4 +1023,36 @@ test "ChatMessage with content_parts set" {
 test {
     // Run tests from all sub-modules
     std.testing.refAllDecls(@This());
+}
+
+test "chatWithSystemEffort forwards explicit effort and preserves simple fallback" {
+    // Regression: simple worker completions dropped the configured effort.
+    const Mock = struct {
+        fn simple(_: *anyopaque, a: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) ![]const u8 {
+            return a.dupe(u8, "simple");
+        }
+        fn chat(_: *anyopaque, a: std.mem.Allocator, request: ChatRequest, model: []const u8, _: f64) !ChatResponse {
+            try std.testing.expectEqualStrings("xhigh", request.reasoning_effort.?);
+            try std.testing.expectEqualStrings("child-model", model);
+            try std.testing.expectEqualStrings("instruction", request.messages[0].content);
+            try std.testing.expectEqualStrings("task", request.messages[1].content);
+            return .{ .content = try a.dupe(u8, "structured") };
+        }
+        fn supports(_: *anyopaque) bool {
+            return false;
+        }
+        fn name(_: *anyopaque) []const u8 {
+            return "mock";
+        }
+        fn deinit(_: *anyopaque) void {}
+    };
+    var state: u8 = 0;
+    const vtable = Provider.VTable{ .chatWithSystem = Mock.simple, .chat = Mock.chat, .supportsNativeTools = Mock.supports, .getName = Mock.name, .deinit = Mock.deinit };
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &vtable };
+    const result = try chatWithSystemEffort(provider, std.testing.allocator, "instruction", "task", "child-model", 0.7, "xhigh");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("structured", result);
+    const fallback = try chatWithSystemEffort(provider, std.testing.allocator, "instruction", "task", "child-model", 0.7, null);
+    defer std.testing.allocator.free(fallback);
+    try std.testing.expectEqualStrings("simple", fallback);
 }

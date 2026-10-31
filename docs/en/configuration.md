@@ -206,6 +206,7 @@ Notes:
 
 - Defines named agent profiles used by the `delegate` tool, `/subagents spawn --agent`, and `bindings`.
 - Each entry may set `provider` + `model`, or a full `provider/model` ref in `model.primary`.
+- Set `reasoning_effort` to `none`, `minimal`, `low`, `medium`, `high`, or `xhigh` to request that effort for the profile. Provider and model support varies. Without it, delegation retains its previous behavior; routed agents inherit the global setting.
 - Example:
 
 ```json
@@ -215,6 +216,7 @@ Notes:
       {
         "id": "coder",
         "model": { "primary": "ollama/qwen3.5:cloud" },
+        "reasoning_effort": "high",
         "system_prompt": "You're an experienced coder"
       }
     ]

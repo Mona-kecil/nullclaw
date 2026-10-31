@@ -150,6 +150,7 @@ const SerializedNamedAgentConfig = struct {
     name: []const u8,
     provider: []const u8,
     model: []const u8,
+    reasoning_effort: ?[]const u8 = null,
     system_prompt: ?[]const u8 = null,
     workspace_path: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
@@ -172,6 +173,7 @@ fn freeNamedAgentSlice(allocator: std.mem.Allocator, agents: []const NamedAgentC
         allocator.free(agent_cfg.name);
         allocator.free(agent_cfg.provider);
         allocator.free(agent_cfg.model);
+        if (agent_cfg.reasoning_effort) |effort| allocator.free(effort);
         if (agent_cfg.system_prompt) |system_prompt| allocator.free(system_prompt);
         if (agent_cfg.system_prompt_path) |system_prompt_path| allocator.free(system_prompt_path);
         if (agent_cfg.workspace_path) |workspace_path| allocator.free(workspace_path);
@@ -1236,6 +1238,7 @@ pub const Config = struct {
                             .name = agent_cfg.name,
                             .provider = agent_cfg.provider,
                             .model = agent_cfg.model,
+                            .reasoning_effort = agent_cfg.reasoning_effort,
                             .system_prompt = agent_cfg.system_prompt_path orelse agent_cfg.system_prompt,
                             .workspace_path = agent_cfg.workspace_path,
                             .api_key = encrypted_key,
@@ -2639,6 +2642,7 @@ test "save roundtrip preserves extended config sections" {
             .name = "helper",
             .provider = "openrouter",
             .model = "openai/gpt-4o-mini",
+            .reasoning_effort = "xhigh",
             .system_prompt = "You are helper.",
             .api_key = "rk_test",
             .temperature = 0.2,
@@ -2818,6 +2822,7 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqualStrings("gsk_test", loaded.model_routes[0].api_key.?);
     try std.testing.expectEqual(@as(usize, 1), loaded.agents.len);
     try std.testing.expectEqualStrings("helper", loaded.agents[0].name);
+    try std.testing.expectEqualStrings("xhigh", loaded.agents[0].reasoning_effort.?);
     try std.testing.expect(!loaded.agents[0].enable_pii_redaction);
     try std.testing.expectEqual(@as(usize, 1), loaded.agent_bindings.len);
     try std.testing.expectEqualStrings("discord", loaded.agent_bindings[0].match.channel.?);
@@ -8151,4 +8156,15 @@ test "Config parseJson rejects truncated JSON" {
     };
     const result = cfg.parseJson(malformed_json);
     try std.testing.expect(std.meta.isError(result));
+}
+
+test "named agent reasoning effort parses and rejects invalid values" {
+    // Regression: per-agent effort must not disappear or silently accept a typo.
+    const allocator = std.testing.allocator;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson("{\"agents\":{\"list\":[{\"id\":\"child\",\"provider\":\"openai\",\"model\":\"model\",\"reasoning_effort\":\"xhigh\"}]}}");
+    defer freeNamedAgentSlice(allocator, cfg.agents);
+    try std.testing.expectEqualStrings("xhigh", cfg.agents[0].reasoning_effort.?);
+    var invalid = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try std.testing.expectError(error.InvalidReasoningEffort, invalid.parseJson("{\"agents\":{\"list\":[{\"id\":\"child\",\"provider\":\"openai\",\"model\":\"model\",\"reasoning_effort\":\"typo\"}]}}"));
 }

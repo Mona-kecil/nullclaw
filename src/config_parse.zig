@@ -238,6 +238,7 @@ fn freeNamedAgentConfig(allocator: std.mem.Allocator, agent_cfg: *types.NamedAge
     allocator.free(agent_cfg.name);
     allocator.free(agent_cfg.provider);
     allocator.free(agent_cfg.model);
+    if (agent_cfg.reasoning_effort) |effort| allocator.free(effort);
     if (agent_cfg.system_prompt) |system_prompt| allocator.free(system_prompt);
     if (agent_cfg.system_prompt_path) |system_prompt_path| allocator.free(system_prompt_path);
     if (agent_cfg.workspace_path) |workspace_path| allocator.free(workspace_path);
@@ -500,6 +501,13 @@ fn parseNamedAgentObject(
         .model = try allocator.dupe(u8, resolved_ref.?.model),
     };
     errdefer freeNamedAgentConfig(allocator, &agent_cfg);
+    if (item.object.get("reasoning_effort")) |effort| if (effort != .null) {
+        if (effort != .string or !(std.mem.eql(u8, effort.string, "none") or
+            std.mem.eql(u8, effort.string, "minimal") or std.mem.eql(u8, effort.string, "low") or
+            std.mem.eql(u8, effort.string, "medium") or std.mem.eql(u8, effort.string, "high") or
+            std.mem.eql(u8, effort.string, "xhigh"))) return error.InvalidReasoningEffort;
+        agent_cfg.reasoning_effort = try allocator.dupe(u8, effort.string);
+    };
     if (item.object.get("system_prompt")) |sp| {
         if (sp == .string) {
             const val = sp.string;

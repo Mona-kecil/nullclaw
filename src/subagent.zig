@@ -59,6 +59,7 @@ pub const TaskRunRequest = struct {
     api_key: ?[]const u8,
     default_provider: []const u8,
     default_model: ?[]const u8,
+    reasoning_effort: ?[]const u8 = null,
     temperature: f64,
     workspace_dir: []const u8,
     allowed_paths: []const []const u8,
@@ -572,6 +573,7 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
         "You are a background subagent. Complete the assigned task concisely and accurately. You have no access to interactive tools — focus on reasoning and analysis.";
     var default_provider = ctx.manager.default_provider;
     var default_model = ctx.manager.default_model;
+    var reasoning_effort: ?[]const u8 = null;
     var temperature: f64 = 0.7;
     var explicit_api_key: ?[]const u8 = null;
     var effective_workspace = ctx.manager.workspace_dir;
@@ -586,6 +588,7 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
 
         default_provider = agent_cfg.provider;
         default_model = agent_cfg.model;
+        reasoning_effort = agent_cfg.reasoning_effort;
         explicit_api_key = agent_cfg.api_key;
         if (agent_cfg.system_prompt) |sp| system_prompt = sp;
         if (agent_cfg.temperature) |t| temperature = t;
@@ -613,6 +616,7 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
             .api_key = api_key,
             .default_provider = default_provider,
             .default_model = default_model,
+            .reasoning_effort = reasoning_effort,
             .temperature = temperature,
             .workspace_dir = effective_workspace,
             .allowed_paths = ctx.manager.allowed_paths,
@@ -660,12 +664,14 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
     );
     defer holder.deinit();
 
-    const result = holder.provider().chatWithSystem(
+    const result = providers.chatWithSystemEffort(
+        holder.provider(),
         cfg_arena.allocator(),
         system_prompt,
         ctx.task,
         model,
         temperature,
+        reasoning_effort,
     ) catch |err| {
         ctx.manager.completeTask(ctx.task_id, null, @errorName(err));
         return;
@@ -1265,4 +1271,22 @@ test "SubagentManager spawn rollback removes task on out-of-memory" {
     );
     try std.testing.expectEqual(@as(usize, 0), mgr.tasks.count());
     try std.testing.expectEqual(@as(u32, 0), mgr.getRunningCount());
+}
+
+fn testTaskRunnerEffort(allocator: Allocator, request: TaskRunRequest) ![]const u8 {
+    try std.testing.expectEqualStrings("child-model", request.default_model.?);
+    try std.testing.expectEqualStrings("xhigh", request.reasoning_effort.?);
+    return allocator.dupe(u8, "ok");
+}
+
+test "spawn forwards named model and reasoning effort" {
+    // Regression: spawned agents previously lost the profile's reasoning effort.
+    const agents = [_]config_mod.NamedAgentConfig{.{ .name = "child", .provider = "test", .model = "child-model", .reasoning_effort = "xhigh" }};
+    const cfg = config_mod.Config{ .workspace_dir = "/tmp", .config_path = "/tmp/config.json", .allocator = std.testing.allocator, .agents = &agents };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    mgr.task_runner = testTaskRunnerEffort;
+    defer mgr.deinit();
+    const id = try mgr.spawnWithAgent("test", "test", "agent", "test", null, "test", "child");
+    try std.testing.expectEqual(TaskStatus.completed, try waitTaskTerminalStatus(&mgr, id));
+    try std.testing.expectEqualStrings("ok", mgr.getTaskResult(id).?);
 }
