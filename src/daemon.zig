@@ -3612,3 +3612,10 @@ test "markError records AddressInUse for gateway component" {
     try std.testing.expectEqual(@as(u64, 1), state.components[0].?.restart_count);
     try std.testing.expectEqualStrings("AddressInUse", state.components[0].?.last_error.?);
 }
+
+test "inbound discord identity is untrusted without bus verification" {
+    // Regression: a webhook can forge both the Discord channel and sender ID.
+    const msg = bus_mod.InboundMessage{ .channel = "discord", .sender_id = "456", .chat_id = "123", .content = "", .session_key = "discord:123" };
+    const context = buildInboundConversationContext(&msg, .{}) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!context.trusted_sender);
+}

@@ -8,6 +8,7 @@ This fork keeps the changes used by Mono. The `mono` branch starts at upstream
 
 ## Local changes
 
+- Allow the verified Discord operator to manage channels in one configured server.
 - Bound Discord typing requests so cleanup cannot stall later replies.
 - Accept native Discord commands through the existing session and access checks.
 - Generate Discord help from the same 52-command catalog used for registration.

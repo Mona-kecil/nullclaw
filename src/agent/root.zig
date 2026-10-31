@@ -496,7 +496,12 @@ pub const Agent = struct {
     fn drainPendingInjection(self: *Agent) !?[]u8 {
         if (self.drain_injection_cb) |drain_cb| {
             if (self.drain_injection_ctx) |drain_ctx| {
-                return try drain_cb(drain_ctx, self.allocator);
+                const injected = try drain_cb(drain_ctx, self.allocator);
+                // Injected text has no verified sender provenance.
+                if (injected) |text| if (text.len > 0) {
+                    if (self.conversation_context) |*context| context.trusted_sender = false;
+                };
+                return injected;
             }
         }
         return null;
@@ -3123,6 +3128,16 @@ pub const Agent = struct {
                 defer @import("../http_util.zig").setThreadInterruptFlag(null);
                 const previous_memory_session_id = tools_mod.setThreadMemorySessionId(self.memory_session_id);
                 defer _ = tools_mod.setThreadMemorySessionId(previous_memory_session_id);
+                const trusted_sender: ?tools_mod.TrustedSender = if (self.conversation_context) |ctx| blk: {
+                    if (ctx.trusted_sender) {
+                        if (ctx.channel) |channel| {
+                            if (ctx.sender_id) |sender_id| break :blk .{ .channel = channel, .sender_id = sender_id };
+                        }
+                    }
+                    break :blk null;
+                } else null;
+                const previous_trusted_sender = tools_mod.setThreadTrustedSender(trusted_sender);
+                defer _ = tools_mod.setThreadTrustedSender(previous_trusted_sender);
                 const result = t.execute(tool_allocator, args) catch |err| {
                     if (verbose_mod.isVerbose()) {
                         log.info("tool result: name={s} error={s}", .{ call.name, @errorName(err) });
@@ -11811,4 +11826,87 @@ test "Agent: redactor scrubs PII in system prompt" {
     // System prompt content must reach provider with email redacted.
     try std.testing.expect(std.mem.indexOf(u8, captured, "[EMAIL_1]") != null);
     try std.testing.expect(std.mem.indexOf(u8, captured, "user@example.com") == null);
+}
+
+test "executeTool derives and restores trusted sender" {
+    // Regression: nested or untrusted turns must not inherit another sender's authority.
+    const Probe = struct {
+        pub const tool_name = "trust_probe";
+        pub const tool_description = "probe";
+        pub const tool_params = "{}";
+        const vtable = tools_mod.ToolVTable(@This());
+        pub fn execute(_: *@This(), _: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            const sender = tools_mod.threadTrustedSender() orelse return tools_mod.ToolResult.ok("none");
+            if (std.mem.eql(u8, sender.channel, "discord") and std.mem.eql(u8, sender.sender_id, "456")) return tools_mod.ToolResult.ok("trusted");
+            return tools_mod.ToolResult.ok("wrong");
+        }
+    };
+    const allocator = std.testing.allocator;
+    var probe = Probe{};
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.tools = &.{.{ .ptr = &probe, .vtable = &Probe.vtable }};
+    const previous = tools_mod.setThreadTrustedSender(.{ .channel = "prior", .sender_id = "1" });
+    defer _ = tools_mod.setThreadTrustedSender(previous);
+    const call = ParsedToolCall{ .name = "trust_probe", .arguments_json = "{}", .tool_call_id = null };
+    agent.conversation_context = .{ .channel = "discord", .sender_id = "456", .trusted_sender = true };
+    try std.testing.expectEqualStrings("trusted", agent.executeTool(allocator, call).output);
+    try std.testing.expectEqualStrings("prior", tools_mod.threadTrustedSender().?.channel);
+    agent.conversation_context.?.trusted_sender = false;
+    try std.testing.expectEqualStrings("none", agent.executeTool(allocator, call).output);
+    agent.conversation_context = null;
+    try std.testing.expectEqualStrings("none", agent.executeTool(allocator, call).output);
+    try std.testing.expectEqualStrings("prior", tools_mod.threadTrustedSender().?.channel);
+}
+
+test "mid turn injection revokes trusted sender for tool calls" {
+    // Regression: unverified injected text must not retain the original sender's authority.
+    const Fixture = struct {
+        calls: usize = 0,
+        inject: bool,
+        observed: ?bool = null,
+        fn drain(ptr: *anyopaque, allocator: std.mem.Allocator) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.inject) return null;
+            self.inject = false;
+            return try allocator.dupe(u8, "injected");
+        }
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{ .content = try allocator.dupe(u8, if (self.calls == 1) "<tool_call>{\"name\":\"trust_probe\",\"arguments\":{}}</tool_call>" else "done") };
+        }
+        fn chatWithSystem(_: *anyopaque, a: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return a.dupe(u8, "");
+        }
+        fn native(_: *anyopaque) bool {
+            return false;
+        }
+        fn name(_: *anyopaque) []const u8 {
+            return "test";
+        }
+        fn deinit(_: *anyopaque) void {}
+        const provider_vtable = Provider.VTable{ .chatWithSystem = chatWithSystem, .chat = chat, .supportsNativeTools = native, .getName = name, .deinit = deinit };
+        pub const tool_name = "trust_probe";
+        pub const tool_description = "probe";
+        pub const tool_params = "{}";
+        const tool_vtable = tools_mod.ToolVTable(@This());
+        pub fn execute(self: *@This(), _: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            self.observed = tools_mod.threadTrustedSender() != null;
+            return tools_mod.ToolResult.ok("ok");
+        }
+    };
+    for ([_]bool{ false, true }) |inject| {
+        var fixture = Fixture{ .inject = inject };
+        var agent = try makeTestAgent(std.testing.allocator);
+        defer agent.deinit();
+        agent.provider = .{ .ptr = &fixture, .vtable = &Fixture.provider_vtable };
+        agent.tools = &.{.{ .ptr = &fixture, .vtable = &Fixture.tool_vtable }};
+        agent.conversation_context = .{ .channel = "discord", .sender_id = "456", .trusted_sender = true };
+        agent.drain_injection_cb = Fixture.drain;
+        agent.drain_injection_ctx = &fixture;
+        const result = try agent.turn("hello");
+        defer std.testing.allocator.free(result);
+        try std.testing.expectEqual(@as(?bool, !inject), fixture.observed);
+    }
 }

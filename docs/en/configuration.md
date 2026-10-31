@@ -878,7 +878,7 @@ Parameters:
 - `allow_bots` (default: false) - Allow messages from other bots
 - `allow_from` (default: []) - User ID allowlist. An omitted or empty list denies inbound messages. `["*"]` explicitly allows all users
 - `require_mention` (default: false) - Require bot mention in guilds to respond
-- `guild_id` (optional) - Reserved for Discord server scoping; current runtime does not enforce it
+- `guild_id` (optional) - Limits native slash commands to this server. With `operator_identity.discord_id`, enables `discord_manage` for verified messages from that operator; the bot needs the Manage Channels permission. Configure exactly one Discord account with a guild ID. Native Discord slash commands cannot use `discord_manage` because they do not carry `trusted_sender`.
 
 NullClaw splits messages >2000 characters (Discord API limit).
 

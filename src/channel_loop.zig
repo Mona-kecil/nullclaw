@@ -1333,6 +1333,7 @@ pub const ChannelRuntime = struct {
 
         // Tools
         const tools = tools_mod.allTools(allocator, config.workspace_dir, .{
+            .discord_manage_binding = tools_mod.discord_manage.bindingFromConfig(config),
             .http_enabled = config.http_request.enabled,
             .http_allowed_domains = config.http_request.allowed_domains,
             .http_max_response_size = config.http_request.max_response_size,
